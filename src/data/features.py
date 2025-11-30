@@ -138,33 +138,97 @@ def detect_fractals(
     """
     Detect Williams Fractals for Support/Resistance levels.
 
-    A fractal high is a high that is higher than n bars before and after.
-    A fractal low is a low that is lower than n bars before and after.
+    IMPORTANT: Uses DELAYED detection to prevent look-ahead bias!
+    A fractal is only marked AFTER it's confirmed (when we have n bars after it).
+
+    At time T, we can only know about fractals at time T-n or earlier,
+    because we need n bars AFTER the fractal point to confirm it.
+
+    A fractal high at bar i requires:
+    - high[i] > high[i-1], high[i-2] (past - OK)
+    - high[i] > high[i+1], high[i+2] (future - must wait for these)
+
+    So at bar i+2, we can finally confirm the fractal at bar i.
+    We mark the fractal at i+2 (current bar) with the VALUE from bar i.
 
     Args:
         df: OHLCV DataFrame
-        n: Number of bars on each side
+        n: Total window size (must be odd, e.g., 5 means 2 bars each side)
 
     Returns:
         Tuple of (fractal_highs, fractal_lows) as boolean Series
+        NOTE: These are DELAYED - the fractal occurred n//2 bars AGO
     """
     half_n = n // 2
 
     fractal_highs = pd.Series(False, index=df.index)
     fractal_lows = pd.Series(False, index=df.index)
 
-    for i in range(half_n, len(df) - half_n):
-        # Check if current high is highest in window
-        window_high = df['high'].iloc[i - half_n:i + half_n + 1]
-        if df['high'].iloc[i] == window_high.max():
+    # Start from position where we have enough PAST data to confirm a fractal
+    # At position i, we're checking if position (i - half_n) was a fractal
+    # This means we're only using data from [i - n + 1] to [i] (all past/current)
+    for i in range(n - 1, len(df)):
+        # The candidate fractal point is half_n bars AGO
+        fractal_idx = i - half_n
+
+        # Window is [fractal_idx - half_n, fractal_idx + half_n] = [i - n + 1, i]
+        # All of this is past data relative to current position i
+        window_start = fractal_idx - half_n
+        window_end = fractal_idx + half_n + 1  # +1 for slice
+
+        window_high = df['high'].iloc[window_start:window_end]
+        window_low = df['low'].iloc[window_start:window_end]
+
+        # Check if the candidate point (half_n bars ago) is a fractal
+        candidate_high = df['high'].iloc[fractal_idx]
+        candidate_low = df['low'].iloc[fractal_idx]
+
+        # Mark at CURRENT position (i), indicating we NOW KNOW about this fractal
+        # The actual S/R level is at df['high'].iloc[fractal_idx]
+        if candidate_high == window_high.max() and candidate_high > window_high.iloc[0] and candidate_high > window_high.iloc[-1]:
             fractal_highs.iloc[i] = True
 
-        # Check if current low is lowest in window
-        window_low = df['low'].iloc[i - half_n:i + half_n + 1]
-        if df['low'].iloc[i] == window_low.min():
+        if candidate_low == window_low.min() and candidate_low < window_low.iloc[0] and candidate_low < window_low.iloc[-1]:
             fractal_lows.iloc[i] = True
 
     return fractal_highs, fractal_lows
+
+
+def get_fractal_levels(
+    df: pd.DataFrame,
+    fractal_window: int = 5
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Get the actual price levels of fractals (with delayed detection).
+
+    Since fractals are detected with a delay, at position i where
+    fractal_highs[i] = True, the actual fractal price is from
+    position i - (fractal_window // 2).
+
+    Returns:
+        Tuple of (resistance_prices, support_prices) as Series
+        NaN where no fractal was detected
+    """
+    half_n = fractal_window // 2
+    fractal_highs, fractal_lows = detect_fractals(df, fractal_window)
+
+    # Get the actual prices where fractals occurred
+    resistance_prices = pd.Series(np.nan, index=df.index, dtype=np.float32)
+    support_prices = pd.Series(np.nan, index=df.index, dtype=np.float32)
+
+    for i in range(len(df)):
+        if fractal_highs.iloc[i]:
+            # The actual fractal was half_n bars ago
+            actual_fractal_idx = i - half_n
+            if actual_fractal_idx >= 0:
+                resistance_prices.iloc[i] = df['high'].iloc[actual_fractal_idx]
+
+        if fractal_lows.iloc[i]:
+            actual_fractal_idx = i - half_n
+            if actual_fractal_idx >= 0:
+                support_prices.iloc[i] = df['low'].iloc[actual_fractal_idx]
+
+    return resistance_prices, support_prices
 
 
 def get_sr_levels(
@@ -175,13 +239,15 @@ def get_sr_levels(
     """
     Get current Support and Resistance levels from recent fractals.
 
+    Uses delayed fractal detection (no look-ahead bias).
+
     Returns:
         Tuple of (resistance_levels, support_levels)
     """
-    fractal_highs, fractal_lows = detect_fractals(df.tail(lookback), fractal_window)
+    resistance_prices, support_prices = get_fractal_levels(df.tail(lookback + fractal_window), fractal_window)
 
-    resistance = df.loc[fractal_highs[fractal_highs].index, 'high'].tolist()
-    support = df.loc[fractal_lows[fractal_lows].index, 'low'].tolist()
+    resistance = resistance_prices.dropna().tolist()
+    support = support_prices.dropna().tolist()
 
     return resistance, support
 
@@ -196,32 +262,35 @@ def distance_to_nearest_sr(
     """
     Calculate ATR-normalized distance to nearest S/R levels.
 
+    Uses delayed fractal detection (no look-ahead bias).
+
     Returns:
         Tuple of (distance_to_resistance, distance_to_support)
     """
     dist_to_r = pd.Series(np.nan, index=price.index, dtype=np.float32)
     dist_to_s = pd.Series(np.nan, index=price.index, dtype=np.float32)
 
-    fractal_highs, fractal_lows = detect_fractals(df, fractal_window)
+    # Get fractal prices (delayed detection - no future leak)
+    resistance_prices, support_prices = get_fractal_levels(df, fractal_window)
 
     for i in range(lookback, len(price)):
-        # Get recent fractals
-        recent_highs = df.loc[fractal_highs.iloc[max(0, i-lookback):i], 'high']
-        recent_lows = df.loc[fractal_lows.iloc[max(0, i-lookback):i], 'low']
+        # Get recent fractal levels (all detected BEFORE current bar)
+        recent_resistances = resistance_prices.iloc[max(0, i-lookback):i].dropna()
+        recent_supports = support_prices.iloc[max(0, i-lookback):i].dropna()
 
         current_price = price.iloc[i]
         current_atr = atr.iloc[i]
 
         if current_atr > 0:
             # Distance to nearest resistance (above current price)
-            resistances = recent_highs[recent_highs > current_price]
-            if len(resistances) > 0:
-                dist_to_r.iloc[i] = (resistances.min() - current_price) / current_atr
+            above_resistances = recent_resistances[recent_resistances > current_price]
+            if len(above_resistances) > 0:
+                dist_to_r.iloc[i] = (above_resistances.min() - current_price) / current_atr
 
             # Distance to nearest support (below current price)
-            supports = recent_lows[recent_lows < current_price]
-            if len(supports) > 0:
-                dist_to_s.iloc[i] = (current_price - supports.max()) / current_atr
+            below_supports = recent_supports[recent_supports < current_price]
+            if len(below_supports) > 0:
+                dist_to_s.iloc[i] = (current_price - below_supports.max()) / current_atr
 
     return dist_to_r.fillna(0), dist_to_s.fillna(0)
 

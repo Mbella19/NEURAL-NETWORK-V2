@@ -5,6 +5,7 @@ Features:
 - Multi-Discrete action space: [Direction (3), Size (4)]
 - Frozen Market Analyst provides context vectors
 - Reward shaping: PnL, transaction costs, FOMO penalty, chop avoidance
+- Normalized observations (prevents scale inconsistencies)
 
 Optimized for M2 Silicon with all float32 operations.
 """
@@ -137,6 +138,20 @@ class TradingEnv(gym.Env):
             dtype=np.float32
         )
 
+        # CRITICAL: Normalize market features to prevent scale inconsistencies!
+        # Market features (ATR ~0.001, CHOP 0-100, ADX 0-100) have vastly different scales.
+        # Compute mean/std for normalization (fit on ALL data for simplicity in RL)
+        if len(market_features.shape) > 1 and market_features.shape[1] > 0:
+            self.market_feat_mean = market_features.mean(axis=0).astype(np.float32)
+            self.market_feat_std = market_features.std(axis=0).astype(np.float32)
+            # Prevent division by zero for constant features
+            self.market_feat_std = np.where(self.market_feat_std > 1e-8,
+                                           self.market_feat_std,
+                                           1.0).astype(np.float32)
+        else:
+            self.market_feat_mean = None
+            self.market_feat_std = None
+
         # Episode state
         self.current_idx = self.start_idx
         self.position = 0  # -1: Short, 0: Flat, 1: Long
@@ -254,13 +269,19 @@ class TradingEnv(gym.Env):
             unrealized_pnl_norm
         ], dtype=np.float32)
 
-        # Market features
+        # Market features (NORMALIZED to prevent scale inconsistencies)
         if len(self.market_features.shape) > 1:
-            market_feat = self.market_features[self.current_idx]
+            market_feat_raw = self.market_features[self.current_idx]
+            # Apply Z-score normalization
+            if self.market_feat_mean is not None and self.market_feat_std is not None:
+                market_feat = ((market_feat_raw - self.market_feat_mean) /
+                              self.market_feat_std).astype(np.float32)
+            else:
+                market_feat = market_feat_raw
         else:
             market_feat = np.zeros(5, dtype=np.float32)
 
-        # Combine all
+        # Combine all (all components now on similar scales)
         obs = np.concatenate([context, position_state, market_feat])
 
         return obs.astype(np.float32)

@@ -3,6 +3,13 @@ Multi-timeframe resampling module.
 
 Resamples 1-minute OHLCV data to 15m, 1H, and 4H timeframes
 with proper gap handling via forward-fill on complete datetime index.
+
+CRITICAL: Uses label='right' to prevent look-ahead bias!
+- With label='left' (default): Row labeled 10:00 contains 10:00-10:59 data
+- With label='right': Row labeled 11:00 contains 10:00-10:59 data
+
+At 10:15, we can only know the COMPLETED 9:00-10:00 hourly candle (labeled 10:00 with right),
+not the in-progress 10:00-11:00 candle. This prevents future data leakage.
 """
 
 import pandas as pd
@@ -41,6 +48,16 @@ def resample_ohlcv(
     """
     Resample OHLCV data to a higher timeframe.
 
+    CRITICAL: Uses label='right' to prevent look-ahead bias!
+    - The timestamp represents when the candle COMPLETED, not when it started.
+    - This ensures that at time T, we only have access to candles that
+      completed at or before time T (no future data leakage).
+
+    Example with 1H resample:
+    - Data from 10:00-10:59 is labeled at 11:00 (when it completed)
+    - At 10:30, forward-fill gives us the 10:00 candle (9:00-9:59 data) - CORRECT
+    - Without label='right', at 10:30 we'd get 10:00 candle with 10:00-10:59 data - WRONG
+
     Args:
         df: DataFrame with datetime index and OHLCV columns
         freq: Target frequency (e.g., '15min', '1H', '4H')
@@ -61,8 +78,10 @@ def resample_ohlcv(
     # Select only columns that exist
     rules = {col: rule for col, rule in ohlcv_rules.items() if col in df.columns}
 
-    # Resample
-    resampled = df.resample(freq).agg(rules)
+    # Resample with label='right' to prevent look-ahead bias
+    # label='right': timestamp is END of period (when candle completes)
+    # closed='right': interval includes right endpoint (10:01-11:00 for 1H)
+    resampled = df.resample(freq, label='right', closed='right').agg(rules)
 
     if fill_gaps:
         # Create complete index and reindex
@@ -125,6 +144,15 @@ def align_timeframes(
 
     The alignment is done by forward-filling higher timeframe data
     onto the 15m index (the fastest timeframe).
+
+    CRITICAL: Prevents look-ahead bias via label='right' resampling!
+    - Higher timeframe candles are labeled at their COMPLETION time
+    - Forward-fill ensures at time T, we only see candles that completed at/before T
+
+    Example at 10:15 (15m candle):
+    - 1H candles labeled: 09:00 (8:01-9:00), 10:00 (9:01-10:00), 11:00 (10:01-11:00)
+    - Forward-fill at 10:15 gives us the 10:00 candle (9:01-10:00 data) ✓ CORRECT
+    - Without label='right', we'd get 10:00 candle with 10:00-10:59 data ✗ WRONG
 
     Args:
         df_15m: 15-minute DataFrame
