@@ -137,49 +137,72 @@ class MultiTimeframeDataset(Dataset):
         )
 
 
-class ScaleAwareLoss(nn.Module):
+class CorrelationAwareLoss(nn.Module):
     """
-    Loss function that addresses mode collapse by:
-    1. MSE for magnitude accuracy
-    2. Direction penalty for sign accuracy  
-    3. Scale penalty to match prediction variance to target variance
+    Loss function that prevents mode collapse using correlation.
     
-    The scale penalty is CRITICAL - without it, the model learns to predict
-    near-zero values (minimizing MSE) instead of matching the target scale.
+    The key insight: if the model outputs constants (mode collapse),
+    the correlation term becomes undefined/unstable, naturally pushing
+    the model toward diverse, meaningful predictions.
     
-    Loss = mse_loss + direction_weight * direction_penalty + scale_weight * scale_penalty
+    Loss = mse_weight * MSE + corr_weight * (1 - correlation) + var_weight * var_penalty
+    
+    The variance penalty directly penalizes low prediction variance,
+    making it impossible to collapse to constant outputs.
     """
     
-    def __init__(self, direction_weight: float = 1.0, scale_weight: float = 1.0):
+    def __init__(self, mse_weight: float = 1.0, corr_weight: float = 2.0, var_weight: float = 5.0):
         """
         Args:
-            direction_weight: Weight for direction penalty
-            scale_weight: Weight for scale matching penalty
+            mse_weight: Weight for MSE loss
+            corr_weight: Weight for correlation loss (1 - pearson_r)
+            var_weight: Weight for variance penalty (penalizes low variance)
         """
         super().__init__()
-        self.direction_weight = direction_weight
-        self.scale_weight = scale_weight
+        self.mse_weight = mse_weight
+        self.corr_weight = corr_weight
+        self.var_weight = var_weight
         
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        predictions = predictions.squeeze()
+        targets = targets.squeeze()
+        
         # 1. MSE loss for magnitude accuracy
         mse_loss = nn.functional.mse_loss(predictions, targets)
         
-        # 2. Direction penalty: penalize wrong sign predictions
-        # Using smooth sign matching: -tanh(pred * target)
-        # When signs match: pred*target > 0 -> tanh > 0 -> penalty < 0 (reward)
-        # When signs differ: pred*target < 0 -> tanh < 0 -> penalty > 0 (penalize)
-        sign_product = predictions * targets
-        direction_penalty = torch.relu(-sign_product).mean()
+        # 2. Correlation loss: maximize Pearson correlation
+        # This naturally requires prediction variance > 0
+        pred_centered = predictions - predictions.mean()
+        target_centered = targets - targets.mean()
         
-        # 3. Scale penalty: penalize when prediction std is too different from target std
-        # This is the KEY fix for mode collapse - forces model to match output scale
-        pred_std = predictions.std() + 1e-8
-        target_std = targets.std() + 1e-8
-        # Log ratio penalizes both too-small and too-large predictions equally
-        scale_penalty = torch.abs(torch.log(pred_std / target_std))
+        pred_std = pred_centered.std() + 1e-8
+        target_std = target_centered.std() + 1e-8
+        
+        # Pearson correlation
+        correlation = (pred_centered * target_centered).mean() / (pred_std * target_std)
+        correlation = torch.clamp(correlation, -1.0, 1.0)  # numerical stability
+        
+        # Correlation loss: 1 - r (0 when perfect, 2 when perfectly anticorrelated)
+        corr_loss = 1.0 - correlation
+        
+        # 3. Variance penalty: DIRECTLY penalize low prediction variance
+        # This is the kill switch for mode collapse
+        # Target variance is ~0.0077 (std ~0.088), so we want pred_var > 0.001 at minimum
+        target_var = targets.var() + 1e-8
+        pred_var = predictions.var() + 1e-8
+        
+        # Penalize when pred_var < target_var using ratio
+        # If pred_var = target_var, penalty = 0
+        # If pred_var << target_var, penalty >> 0
+        var_ratio = target_var / pred_var  # large when pred_var is small
+        var_penalty = torch.relu(var_ratio - 1.0)  # only penalize when pred_var < target_var
         
         # Combined loss
-        total_loss = mse_loss + self.direction_weight * direction_penalty + self.scale_weight * scale_penalty
+        total_loss = (
+            self.mse_weight * mse_loss + 
+            self.corr_weight * corr_loss + 
+            self.var_weight * var_penalty
+        )
         
         return total_loss
 
@@ -259,10 +282,10 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function: ScaleAwareLoss = MSE + Direction penalty + Scale penalty
-        # The scale penalty is CRITICAL - forces predictions to match target variance
-        # This prevents mode collapse where model predicts ~0 for everything
-        self.criterion = ScaleAwareLoss(direction_weight=1.0, scale_weight=1.0)
+        # Loss function: CorrelationAwareLoss = MSE + Correlation + Variance penalty
+        # The variance penalty DIRECTLY prevents mode collapse by penalizing low pred variance
+        # Correlation loss encourages matching target patterns, not just mean
+        self.criterion = CorrelationAwareLoss(mse_weight=1.0, corr_weight=2.0, var_weight=5.0)
 
         # Training history
         self.train_losses = []
