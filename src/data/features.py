@@ -601,28 +601,40 @@ def engineer_all_features(
 def create_smoothed_target(
     df: pd.DataFrame,
     future_window: int = 12,
-    smooth_window: int = 12
+    smooth_window: int = 12,
+    scale_factor: float = 100.0
 ) -> pd.Series:
     """
     Create the smoothed future return target for Analyst training.
 
-    Target = (smoothed future close / current close) - 1
+    Target = ((smoothed future close / current close) - 1) * scale_factor
 
     This teaches the model sustained momentum, not noise.
     
-    FIXED: Added min_periods=1 to reduce NaN data loss at edges.
+    FIXED: 
+    - Added min_periods=1 to reduce NaN data loss at edges.
+    - Scale by 100 to get PERCENTAGE returns (prevents mode collapse to near-zero)
+    
+    Without scaling, targets are ~0.0001 and the model learns trivial solution
+    of always predicting 0. With scale_factor=100, targets are ~0.01 (1% moves)
+    which forces the model to learn real patterns.
 
     Args:
         df: DataFrame with 'close' column
         future_window: How many candles ahead
         smooth_window: Rolling window for smoothing
+        scale_factor: Multiply returns by this (100 = percentage returns)
 
     Returns:
-        Series of target values
+        Series of target values (in percentage if scale_factor=100)
     """
     # Use min_periods=1 to reduce NaN values at the edges
     future_smoothed = df['close'].shift(-future_window).rolling(smooth_window, min_periods=1).mean()
     target = (future_smoothed / df['close']) - 1
+    
+    # Scale to percentage returns to prevent mode collapse
+    # Without this, targets are ~0.0001 and model predicts ~0 for everything
+    target = target * scale_factor
 
     return target.astype(np.float32)
 

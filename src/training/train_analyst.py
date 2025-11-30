@@ -137,13 +137,53 @@ class MultiTimeframeDataset(Dataset):
         )
 
 
+class DirectionalLoss(nn.Module):
+    """
+    Combined loss: Huber + Direction penalty.
+    
+    Prevents mode collapse by penalizing wrong direction predictions.
+    Without this, the model can minimize MSE by predicting ~0 for everything
+    (since targets are small), achieving low loss but useless predictions.
+    
+    Loss = huber_loss + direction_weight * direction_penalty
+    
+    where direction_penalty = mean(relu(-pred * target))
+    (penalizes when prediction and target have opposite signs)
+    """
+    
+    def __init__(self, huber_delta: float = 0.5, direction_weight: float = 0.5):
+        """
+        Args:
+            huber_delta: Delta for Huber loss (smaller = more sensitive to small errors)
+            direction_weight: Weight for direction penalty (0.5 = equal importance)
+        """
+        super().__init__()
+        self.huber = nn.HuberLoss(delta=huber_delta)
+        self.direction_weight = direction_weight
+        
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Standard Huber loss for magnitude
+        huber_loss = self.huber(predictions, targets)
+        
+        # Direction penalty: penalize when signs disagree
+        # pred * target < 0 means opposite signs
+        # We use smooth approximation: -tanh(pred) * sign(target)
+        sign_product = predictions * targets  # positive if same sign
+        direction_penalty = torch.relu(-sign_product).mean()  # penalize negative products
+        
+        # Combined loss
+        total_loss = huber_loss + self.direction_weight * direction_penalty
+        
+        return total_loss
+
+
 class AnalystTrainer:
     """
     Trainer class for the Market Analyst model.
 
     Features:
     - AdamW optimizer with weight decay
-    - Huber loss for robustness
+    - DirectionalLoss for robustness and direction accuracy
     - Early stopping
     - Memory-efficient batch processing
     - Checkpoint saving
@@ -212,8 +252,10 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function (Huber is more robust to outliers)
-        self.criterion = nn.HuberLoss(delta=1.0)
+        # Loss function: DirectionalLoss = Huber + Direction penalty
+        # This prevents mode collapse where model predicts ~0 for everything
+        # huber_delta=0.5 for scaled percentage targets, direction_weight=0.5 for balance
+        self.criterion = DirectionalLoss(huber_delta=0.5, direction_weight=0.5)
 
         # Training history
         self.train_losses = []
