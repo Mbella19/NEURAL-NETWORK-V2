@@ -5,24 +5,323 @@ Trains the RL agent using a frozen Market Analyst to provide
 context vectors for decision making.
 
 Memory-optimized for Apple M2 Silicon.
+
+Features:
+- Comprehensive logging of training progress
+- Detailed reward and action statistics
+- Training visualizations (reward curves, action distributions)
+- Episode-level tracking and analysis
 """
 
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import Optional, Dict, Tuple
-import logging
+from typing import Optional, Dict, Tuple, List
+from datetime import datetime
 import gc
+import json
 
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback
 
 from ..models.analyst import load_analyst, MarketAnalyst
 from ..environments.trading_env import TradingEnv
 from ..agents.sniper_agent import SniperAgent, create_agent
+from ..utils.logging_config import setup_logging, get_logger
+from ..utils.metrics import calculate_trading_metrics, TradingMetrics
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+class AgentTrainingLogger(BaseCallback):
+    """
+    Custom callback for detailed agent training logging.
+
+    Tracks:
+    - Episode rewards
+    - Action distributions
+    - PnL statistics
+    - Win rate evolution
+    """
+
+    def __init__(
+        self,
+        log_dir: Optional[str] = None,
+        log_freq: int = 1000,
+        verbose: int = 1
+    ):
+        super().__init__(verbose)
+        self.log_dir = Path(log_dir) if log_dir else None
+        self.log_freq = log_freq
+
+        # Tracking variables
+        self.episode_rewards: List[float] = []
+        self.episode_lengths: List[int] = []
+        self.episode_pnls: List[float] = []
+        self.episode_trades: List[int] = []
+        self.episode_win_rates: List[float] = []
+        self.action_counts = {0: 0, 1: 0, 2: 0}  # Flat, Long, Short
+        self.timestep_rewards: List[float] = []
+
+        # Current episode tracking
+        self.current_ep_reward = 0
+        self.current_ep_length = 0
+        self.current_ep_actions = []
+
+        # Training start time
+        self.start_time = None
+
+        if self.log_dir:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    def _on_training_start(self):
+        self.start_time = datetime.now()
+        logger.info("=" * 70)
+        logger.info("PPO AGENT TRAINING STARTED")
+        logger.info("=" * 70)
+        logger.info(f"Total timesteps: {self.model.num_timesteps if hasattr(self.model, 'num_timesteps') else 'N/A'}")
+        logger.info(f"Log directory: {self.log_dir}")
+        logger.info("=" * 70)
+
+    def _on_step(self) -> bool:
+        # Track rewards
+        if len(self.locals.get('rewards', [])) > 0:
+            reward = self.locals['rewards'][0]
+            self.timestep_rewards.append(reward)
+            self.current_ep_reward += reward
+            self.current_ep_length += 1
+
+        # Track actions
+        if len(self.locals.get('actions', [])) > 0:
+            action = self.locals['actions'][0]
+            if isinstance(action, np.ndarray):
+                action = action[0] if len(action) == 1 else action
+            if isinstance(action, (int, np.integer)):
+                self.action_counts[int(action)] = self.action_counts.get(int(action), 0) + 1
+                self.current_ep_actions.append(int(action))
+
+        # Check for episode done
+        dones = self.locals.get('dones', [False])
+        if any(dones):
+            self.episode_rewards.append(self.current_ep_reward)
+            self.episode_lengths.append(self.current_ep_length)
+
+            # Get episode info if available
+            infos = self.locals.get('infos', [{}])
+            if len(infos) > 0 and infos[0]:
+                info = infos[0]
+                self.episode_pnls.append(info.get('total_pnl', 0.0))
+                self.episode_trades.append(info.get('total_trades', 0))
+                self.episode_win_rates.append(info.get('win_rate', 0.0))
+
+            # Log episode summary
+            n_episodes = len(self.episode_rewards)
+            if n_episodes % 10 == 0:
+                self._log_episode_summary(n_episodes)
+
+            # Reset current episode tracking
+            self.current_ep_reward = 0
+            self.current_ep_length = 0
+            self.current_ep_actions = []
+
+        # Periodic detailed logging
+        if self.n_calls % self.log_freq == 0:
+            self._log_training_progress()
+
+        return True
+
+    def _log_episode_summary(self, n_episodes: int):
+        """Log summary for recent episodes."""
+        recent_rewards = self.episode_rewards[-10:]
+        recent_pnls = self.episode_pnls[-10:] if self.episode_pnls else [0]
+
+        logger.info("-" * 50)
+        logger.info(f"Episode {n_episodes} Summary:")
+        logger.info(f"  Recent Avg Reward: {np.mean(recent_rewards):.2f}")
+        logger.info(f"  Recent Avg PnL: {np.mean(recent_pnls):.2f} pips")
+        logger.info(f"  Episode Length: {self.episode_lengths[-1]}")
+
+        if self.episode_win_rates:
+            logger.info(f"  Win Rate: {self.episode_win_rates[-1]*100:.1f}%")
+
+    def _log_training_progress(self):
+        """Log overall training progress."""
+        total_actions = sum(self.action_counts.values())
+        if total_actions == 0:
+            return
+
+        action_pcts = {k: v/total_actions*100 for k, v in self.action_counts.items()}
+
+        logger.info("-" * 50)
+        logger.info(f"Training Progress @ {self.n_calls} steps:")
+        logger.info(f"  Episodes completed: {len(self.episode_rewards)}")
+        logger.info(f"  Action Distribution: Flat={action_pcts.get(0, 0):.1f}%, "
+                   f"Long={action_pcts.get(1, 0):.1f}%, Short={action_pcts.get(2, 0):.1f}%")
+
+        if self.episode_rewards:
+            logger.info(f"  Avg Episode Reward: {np.mean(self.episode_rewards):.2f}")
+            logger.info(f"  Max Episode Reward: {np.max(self.episode_rewards):.2f}")
+            logger.info(f"  Min Episode Reward: {np.min(self.episode_rewards):.2f}")
+
+        if self.episode_pnls:
+            logger.info(f"  Avg PnL: {np.mean(self.episode_pnls):.2f} pips")
+
+        # Memory info
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        gc.collect()
+
+    def _on_training_end(self):
+        """Log final training summary and create visualizations."""
+        total_time = (datetime.now() - self.start_time).total_seconds()
+
+        logger.info("=" * 70)
+        logger.info("PPO AGENT TRAINING COMPLETED")
+        logger.info("=" * 70)
+        logger.info(f"Total Training Time: {total_time/60:.1f} minutes")
+        logger.info(f"Total Episodes: {len(self.episode_rewards)}")
+        logger.info(f"Total Timesteps: {self.n_calls}")
+
+        if self.episode_rewards:
+            logger.info(f"Final Avg Reward (last 100): {np.mean(self.episode_rewards[-100:]):.2f}")
+
+        if self.episode_pnls:
+            logger.info(f"Final Avg PnL (last 100): {np.mean(self.episode_pnls[-100:]):.2f} pips")
+
+        logger.info("=" * 70)
+
+        # Save metrics
+        if self.log_dir:
+            self._save_metrics()
+            self._create_visualizations()
+
+    def _save_metrics(self):
+        """Save training metrics to JSON."""
+        metrics = {
+            'episode_rewards': self.episode_rewards,
+            'episode_lengths': self.episode_lengths,
+            'episode_pnls': self.episode_pnls,
+            'episode_trades': self.episode_trades,
+            'episode_win_rates': self.episode_win_rates,
+            'action_counts': self.action_counts,
+            'total_timesteps': self.n_calls,
+            'total_episodes': len(self.episode_rewards)
+        }
+
+        metrics_path = self.log_dir / 'agent_training_metrics.json'
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
+
+        logger.info(f"Metrics saved to: {metrics_path}")
+
+    def _create_visualizations(self):
+        """Create training visualizations."""
+        if len(self.episode_rewards) < 10:
+            logger.warning("Not enough episodes for visualizations")
+            return
+
+        fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+
+        # Episode rewards
+        ax = axes[0, 0]
+        ax.plot(self.episode_rewards, alpha=0.3, color='blue')
+        # Smoothed
+        window = min(50, len(self.episode_rewards) // 5 + 1)
+        smoothed = np.convolve(self.episode_rewards, np.ones(window)/window, mode='valid')
+        ax.plot(range(window-1, len(self.episode_rewards)), smoothed,
+               color='red', linewidth=2, label=f'Smoothed (w={window})')
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Reward')
+        ax.set_title('Episode Rewards')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # PnL per episode
+        ax = axes[0, 1]
+        if self.episode_pnls:
+            ax.plot(self.episode_pnls, alpha=0.3, color='green')
+            if len(self.episode_pnls) >= window:
+                smoothed_pnl = np.convolve(self.episode_pnls, np.ones(window)/window, mode='valid')
+                ax.plot(range(window-1, len(self.episode_pnls)), smoothed_pnl,
+                       color='darkgreen', linewidth=2)
+            ax.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('PnL (pips)')
+        ax.set_title('Episode PnL')
+        ax.grid(True, alpha=0.3)
+
+        # Win rate evolution
+        ax = axes[0, 2]
+        if self.episode_win_rates:
+            ax.plot(self.episode_win_rates, alpha=0.5, color='purple')
+            ax.axhline(y=0.5, color='k', linestyle='--', alpha=0.5, label='50%')
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Win Rate')
+        ax.set_title('Win Rate Evolution')
+        ax.set_ylim([0, 1])
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # Action distribution
+        ax = axes[1, 0]
+        action_names = ['Flat', 'Long', 'Short']
+        action_vals = [self.action_counts.get(i, 0) for i in range(3)]
+        colors = ['gray', 'green', 'red']
+        bars = ax.bar(action_names, action_vals, color=colors)
+        ax.set_ylabel('Count')
+        ax.set_title('Action Distribution')
+        # Add percentage labels
+        total = sum(action_vals)
+        if total > 0:
+            for bar, val in zip(bars, action_vals):
+                pct = val / total * 100
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                       f'{pct:.1f}%', ha='center', va='bottom')
+
+        # Episode length distribution
+        ax = axes[1, 1]
+        ax.hist(self.episode_lengths, bins=30, color='blue', alpha=0.7)
+        ax.axvline(x=np.mean(self.episode_lengths), color='red',
+                  linestyle='--', label=f'Mean: {np.mean(self.episode_lengths):.0f}')
+        ax.set_xlabel('Episode Length')
+        ax.set_ylabel('Count')
+        ax.set_title('Episode Length Distribution')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # Cumulative PnL
+        ax = axes[1, 2]
+        if self.episode_pnls:
+            cumulative_pnl = np.cumsum(self.episode_pnls)
+            ax.plot(cumulative_pnl, color='green', linewidth=2)
+            ax.fill_between(range(len(cumulative_pnl)), cumulative_pnl, alpha=0.3)
+            ax.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Cumulative PnL (pips)')
+        ax.set_title('Cumulative PnL')
+        ax.grid(True, alpha=0.3)
+
+        plt.suptitle('PPO Agent Training Summary', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+
+        save_path = self.log_dir / 'agent_training_summary.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        logger.info(f"Training visualization saved to: {save_path}")
+
+    def get_metrics(self) -> Dict:
+        """Get all tracked metrics."""
+        return {
+            'episode_rewards': self.episode_rewards,
+            'episode_lengths': self.episode_lengths,
+            'episode_pnls': self.episode_pnls,
+            'episode_trades': self.episode_trades,
+            'episode_win_rates': self.episode_win_rates,
+            'action_counts': self.action_counts
+        }
 
 
 def prepare_env_data(
@@ -172,6 +471,11 @@ def train_agent(
     Returns:
         Tuple of (trained agent, training info)
     """
+    # Setup logging for this run
+    log_dir = Path(save_path)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    setup_logging(str(log_dir), name="agent_training")
+
     # Device selection
     if device is None:
         if torch.backends.mps.is_available():
@@ -191,6 +495,10 @@ def train_agent(
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
     logger.info("Analyst loaded and frozen")
 
+    # Log analyst info
+    logger.info(f"Analyst context_dim: {analyst.context_dim}")
+    logger.info(f"Analyst parameters: {sum(p.numel() for p in analyst.parameters()):,} (frozen)")
+
     # Prepare data
     logger.info("Preparing environment data...")
     lookback_15m = 48
@@ -202,8 +510,12 @@ def train_agent(
         lookback_15m, lookback_1h, lookback_4h
     )
 
+    logger.info(f"Data shapes: 15m={data_15m.shape}, 1h={data_1h.shape}, 4h={data_4h.shape}")
+    logger.info(f"Price range: {close_prices.min():.5f} - {close_prices.max():.5f}")
+
     # Split into train/eval
     split_idx = int(0.85 * len(close_prices))
+    logger.info(f"Train samples: {split_idx}, Eval samples: {len(close_prices) - split_idx}")
 
     train_data = (
         data_15m[:split_idx],
@@ -238,6 +550,10 @@ def train_agent(
         device=device
     )
 
+    # Log environment info
+    logger.info(f"Observation space: {train_env.observation_space}")
+    logger.info(f"Action space: {train_env.action_space}")
+
     # Wrap environments
     train_env = Monitor(train_env)
     eval_env = Monitor(eval_env)
@@ -246,22 +562,57 @@ def train_agent(
     logger.info("Creating PPO agent...")
     agent = create_agent(train_env, config)
 
+    # Create training logger callback
+    training_callback = AgentTrainingLogger(
+        log_dir=str(log_dir),
+        log_freq=5000,
+        verbose=1
+    )
+
     # Train
     logger.info(f"Starting training for {total_timesteps:,} timesteps...")
+    logger.info("-" * 70)
+
     training_info = agent.train(
         total_timesteps=total_timesteps,
         eval_env=eval_env,
         eval_freq=10_000,
-        save_path=save_path
+        save_path=save_path,
+        callback=training_callback
     )
 
+    # Get metrics from callback
+    training_info['callback_metrics'] = training_callback.get_metrics()
+
     # Final evaluation
+    logger.info("=" * 70)
     logger.info("Running final evaluation...")
     eval_results = agent.evaluate(eval_env, n_episodes=20)
     training_info['final_eval'] = eval_results
 
-    logger.info(f"Training complete. Final mean reward: {eval_results['mean_reward']:.2f}")
-    logger.info(f"Mean PnL: {eval_results['mean_pnl']:.2f} pips")
+    logger.info("-" * 70)
+    logger.info("FINAL EVALUATION RESULTS:")
+    logger.info(f"  Mean Reward: {eval_results['mean_reward']:.2f} +/- {eval_results['std_reward']:.2f}")
+    logger.info(f"  Mean PnL: {eval_results['mean_pnl']:.2f} pips")
+    logger.info(f"  Win Rate: {eval_results.get('win_rate', 0)*100:.1f}%")
+    logger.info(f"  Mean Trades per Episode: {eval_results.get('mean_trades', 0):.1f}")
+    logger.info("-" * 70)
+
+    # Save training summary
+    summary = {
+        'total_timesteps': total_timesteps,
+        'total_episodes': len(training_callback.episode_rewards),
+        'final_mean_reward': eval_results['mean_reward'],
+        'final_mean_pnl': eval_results['mean_pnl'],
+        'final_win_rate': eval_results.get('win_rate', 0),
+        'action_distribution': training_callback.action_counts,
+        'avg_episode_length': float(np.mean(training_callback.episode_lengths)) if training_callback.episode_lengths else 0
+    }
+
+    summary_path = log_dir / 'training_summary.json'
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"Training summary saved to: {summary_path}")
 
     # Cleanup
     train_env.close()
@@ -300,6 +651,9 @@ def load_and_evaluate(
     if device is None:
         device = torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu')
 
+    logger.info(f"Loading agent from {agent_path}")
+    logger.info(f"Evaluating on {n_episodes} episodes")
+
     # Load analyst
     feature_dims = {'15m': len(feature_cols), '1h': len(feature_cols), '4h': len(feature_cols)}
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
@@ -327,7 +681,15 @@ def load_and_evaluate(
     agent = SniperAgent.load(agent_path, test_env, device='cpu')  # SB3 more stable on CPU
 
     # Evaluate
+    logger.info("Running evaluation...")
     results = agent.evaluate(test_env, n_episodes=n_episodes)
+
+    logger.info("=" * 70)
+    logger.info("EVALUATION RESULTS:")
+    logger.info(f"  Mean Reward: {results['mean_reward']:.2f} +/- {results['std_reward']:.2f}")
+    logger.info(f"  Mean PnL: {results['mean_pnl']:.2f} pips")
+    logger.info(f"  Win Rate: {results.get('win_rate', 0)*100:.1f}%")
+    logger.info("=" * 70)
 
     test_env.close()
     return results

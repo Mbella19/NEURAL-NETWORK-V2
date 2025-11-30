@@ -205,7 +205,8 @@ class SniperAgent:
         eval_env: Optional[gym.Env] = None,
         eval_freq: int = 10_000,
         save_path: Optional[str] = None,
-        callbacks: Optional[list] = None
+        callbacks: Optional[list] = None,
+        callback: Optional[BaseCallback] = None
     ) -> Dict[str, Any]:
         """
         Train the agent.
@@ -215,7 +216,8 @@ class SniperAgent:
             eval_env: Optional evaluation environment
             eval_freq: Evaluation frequency
             save_path: Path to save best model
-            callbacks: Additional callbacks
+            callbacks: Additional callbacks (list)
+            callback: Single callback (for convenience)
 
         Returns:
             Training info dictionary
@@ -228,6 +230,10 @@ class SniperAgent:
 
         if callbacks:
             callback_list.extend(callbacks)
+
+        # Support single callback parameter
+        if callback is not None:
+            callback_list.append(callback)
 
         # Add evaluation callback if eval_env provided
         if eval_env is not None and save_path is not None:
