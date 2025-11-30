@@ -137,42 +137,49 @@ class MultiTimeframeDataset(Dataset):
         )
 
 
-class DirectionalLoss(nn.Module):
+class ScaleAwareLoss(nn.Module):
     """
-    Combined loss: Huber + Direction penalty.
+    Loss function that addresses mode collapse by:
+    1. MSE for magnitude accuracy
+    2. Direction penalty for sign accuracy  
+    3. Scale penalty to match prediction variance to target variance
     
-    Prevents mode collapse by penalizing wrong direction predictions.
-    Without this, the model can minimize MSE by predicting ~0 for everything
-    (since targets are small), achieving low loss but useless predictions.
+    The scale penalty is CRITICAL - without it, the model learns to predict
+    near-zero values (minimizing MSE) instead of matching the target scale.
     
-    Loss = huber_loss + direction_weight * direction_penalty
-    
-    where direction_penalty = mean(relu(-pred * target))
-    (penalizes when prediction and target have opposite signs)
+    Loss = mse_loss + direction_weight * direction_penalty + scale_weight * scale_penalty
     """
     
-    def __init__(self, huber_delta: float = 0.5, direction_weight: float = 0.5):
+    def __init__(self, direction_weight: float = 1.0, scale_weight: float = 1.0):
         """
         Args:
-            huber_delta: Delta for Huber loss (smaller = more sensitive to small errors)
-            direction_weight: Weight for direction penalty (0.5 = equal importance)
+            direction_weight: Weight for direction penalty
+            scale_weight: Weight for scale matching penalty
         """
         super().__init__()
-        self.huber = nn.HuberLoss(delta=huber_delta)
         self.direction_weight = direction_weight
+        self.scale_weight = scale_weight
         
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Standard Huber loss for magnitude
-        huber_loss = self.huber(predictions, targets)
+        # 1. MSE loss for magnitude accuracy
+        mse_loss = nn.functional.mse_loss(predictions, targets)
         
-        # Direction penalty: penalize when signs disagree
-        # pred * target < 0 means opposite signs
-        # We use smooth approximation: -tanh(pred) * sign(target)
-        sign_product = predictions * targets  # positive if same sign
-        direction_penalty = torch.relu(-sign_product).mean()  # penalize negative products
+        # 2. Direction penalty: penalize wrong sign predictions
+        # Using smooth sign matching: -tanh(pred * target)
+        # When signs match: pred*target > 0 -> tanh > 0 -> penalty < 0 (reward)
+        # When signs differ: pred*target < 0 -> tanh < 0 -> penalty > 0 (penalize)
+        sign_product = predictions * targets
+        direction_penalty = torch.relu(-sign_product).mean()
+        
+        # 3. Scale penalty: penalize when prediction std is too different from target std
+        # This is the KEY fix for mode collapse - forces model to match output scale
+        pred_std = predictions.std() + 1e-8
+        target_std = targets.std() + 1e-8
+        # Log ratio penalizes both too-small and too-large predictions equally
+        scale_penalty = torch.abs(torch.log(pred_std / target_std))
         
         # Combined loss
-        total_loss = huber_loss + self.direction_weight * direction_penalty
+        total_loss = mse_loss + self.direction_weight * direction_penalty + self.scale_weight * scale_penalty
         
         return total_loss
 
@@ -195,7 +202,7 @@ class AnalystTrainer:
         self,
         model: MarketAnalyst,
         device: torch.device,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 1e-3,  # Increased from 1e-4 to escape mode collapse
         weight_decay: float = 1e-5,
         patience: int = 10,
         cache_clear_interval: int = 50,
@@ -252,10 +259,10 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function: DirectionalLoss = Huber + Direction penalty
+        # Loss function: ScaleAwareLoss = MSE + Direction penalty + Scale penalty
+        # The scale penalty is CRITICAL - forces predictions to match target variance
         # This prevents mode collapse where model predicts ~0 for everything
-        # huber_delta=0.5 for scaled percentage targets, direction_weight=0.5 for balance
-        self.criterion = DirectionalLoss(huber_delta=0.5, direction_weight=0.5)
+        self.criterion = ScaleAwareLoss(direction_weight=1.0, scale_weight=1.0)
 
         # Training history
         self.train_losses = []

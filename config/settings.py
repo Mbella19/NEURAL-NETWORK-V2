@@ -110,7 +110,7 @@ class AnalystConfig:
 
     # Training
     batch_size: int = 32        # Conservative for M2
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-3  # Increased from 1e-4 to escape mode collapse
     weight_decay: float = 1e-5
     max_epochs: int = 100
     patience: int = 10          # Early stopping patience

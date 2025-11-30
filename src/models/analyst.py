@@ -134,11 +134,33 @@ class MarketAnalyst(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize linear layer weights."""
-        for module in [self.trend_head, self.context_proj]:
+        """
+        Initialize linear layer weights.
+        
+        CRITICAL: The final layer of trend_head needs larger weights to produce
+        outputs in the target range (~0.01-0.1 for percentage returns).
+        Standard Xavier init produces outputs that are too small, causing mode collapse.
+        """
+        for module in [self.context_proj]:
             if isinstance(module, nn.Sequential):
                 for layer in module:
                     if isinstance(layer, nn.Linear):
+                        nn.init.xavier_uniform_(layer.weight)
+                        if layer.bias is not None:
+                            nn.init.zeros_(layer.bias)
+        
+        # Special initialization for trend_head to match target scale
+        # Target std is ~0.088 (percentage returns), so we need larger final layer weights
+        if isinstance(self.trend_head, nn.Sequential):
+            for i, layer in enumerate(self.trend_head):
+                if isinstance(layer, nn.Linear):
+                    if i == len(list(self.trend_head)) - 1:
+                        # Final layer: use larger weights for correct output scale
+                        # Scale factor ~10x to produce outputs in range [-0.5, 0.5]
+                        nn.init.xavier_uniform_(layer.weight, gain=10.0)
+                        if layer.bias is not None:
+                            nn.init.zeros_(layer.bias)
+                    else:
                         nn.init.xavier_uniform_(layer.weight)
                         if layer.bias is not None:
                             nn.init.zeros_(layer.bias)
