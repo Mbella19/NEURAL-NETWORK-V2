@@ -36,6 +36,7 @@ from config.settings import Config, get_device, clear_memory
 from src.data.loader import load_ohlcv
 from src.data.resampler import create_multi_timeframe_dataset
 from src.data.features import engineer_all_features, get_feature_columns
+from src.data.normalizer import FeatureNormalizer, normalize_multi_timeframe
 from src.models.analyst import create_analyst, load_analyst
 from src.training.train_analyst import train_analyst, MultiTimeframeDataset
 from src.training.train_agent import train_agent, prepare_env_data, create_trading_env
@@ -139,7 +140,7 @@ def step_3_engineer_features(
 
     logger.info(f"Features: {list(df_15m.columns)}")
 
-    # Save processed data
+    # Save processed data (before normalization for reference)
     processed_path = config.paths.data_processed
     df_15m.to_parquet(processed_path / 'features_15m.parquet')
     df_1h.to_parquet(processed_path / 'features_1h.parquet')
@@ -147,6 +148,61 @@ def step_3_engineer_features(
     logger.info(f"Saved processed data to {processed_path}")
 
     return df_15m, df_1h, df_4h
+
+
+def step_3b_normalize_features(
+    df_15m: pd.DataFrame,
+    df_1h: pd.DataFrame,
+    df_4h: pd.DataFrame,
+    feature_cols: list,
+    config: Config
+) -> tuple:
+    """
+    Step 3b: Normalize features using StandardScaler (Z-Score).
+
+    CRITICAL: This prevents large-scale features from dominating gradients.
+    Normalization is fit on TRAINING data only to prevent look-ahead bias.
+    """
+    logger.info("=" * 60)
+    logger.info("STEP 3b: Feature Normalization (Z-Score)")
+    logger.info("=" * 60)
+
+    # Calculate training split index
+    train_end_idx = int(len(df_15m) * config.data.train_ratio)
+    logger.info(f"Fitting normalizer on first {train_end_idx:,} samples (training data only)")
+
+    # Log pre-normalization statistics
+    logger.info("Pre-normalization feature ranges:")
+    for col in feature_cols[:6]:  # Show first 6
+        if col in df_15m.columns:
+            logger.info(f"  {col}: min={df_15m[col].min():.6f}, max={df_15m[col].max():.6f}")
+
+    # Normalize all timeframes using training data statistics
+    df_15m_norm, df_1h_norm, df_4h_norm, normalizer = normalize_multi_timeframe(
+        df_15m, df_1h, df_4h,
+        feature_cols,
+        train_end_idx=train_end_idx
+    )
+
+    # Log post-normalization statistics
+    logger.info("Post-normalization feature ranges (should be ~[-3, 3]):")
+    for col in feature_cols[:6]:
+        if col in df_15m_norm.columns:
+            logger.info(f"  {col}: min={df_15m_norm[col].min():.3f}, max={df_15m_norm[col].max():.3f}")
+
+    # Save normalizer for inference
+    normalizer_path = config.paths.models_analyst / 'normalizer.pkl'
+    normalizer.save(normalizer_path)
+    logger.info(f"Normalizer saved to {normalizer_path}")
+
+    # Save normalized data
+    processed_path = config.paths.data_processed
+    df_15m_norm.to_parquet(processed_path / 'features_15m_normalized.parquet')
+    df_1h_norm.to_parquet(processed_path / 'features_1h_normalized.parquet')
+    df_4h_norm.to_parquet(processed_path / 'features_4h_normalized.parquet')
+    logger.info(f"Saved normalized data to {processed_path}")
+
+    return df_15m_norm, df_1h_norm, df_4h_norm, normalizer
 
 
 def step_4_train_analyst(
@@ -333,15 +389,17 @@ def main():
     config.paths.ensure_dirs()
 
     try:
+        # Define feature columns used throughout the pipeline
+        feature_cols = ['open', 'high', 'low', 'close', 'atr',
+                       'pinbar', 'engulfing', 'doji', 'ema_trend',
+                       'regime', 'returns', 'volatility']
+
         if args.backtest_only:
-            # Load processed data
-            logger.info("Loading processed data...")
-            df_15m = pd.read_parquet(config.paths.data_processed / 'features_15m.parquet')
-            df_1h = pd.read_parquet(config.paths.data_processed / 'features_1h.parquet')
-            df_4h = pd.read_parquet(config.paths.data_processed / 'features_4h.parquet')
-            feature_cols = ['open', 'high', 'low', 'close', 'atr',
-                           'pinbar', 'engulfing', 'doji', 'ema_trend',
-                           'regime', 'returns', 'volatility']
+            # Load normalized processed data
+            logger.info("Loading normalized processed data...")
+            df_15m = pd.read_parquet(config.paths.data_processed / 'features_15m_normalized.parquet')
+            df_1h = pd.read_parquet(config.paths.data_processed / 'features_1h_normalized.parquet')
+            df_4h = pd.read_parquet(config.paths.data_processed / 'features_4h_normalized.parquet')
             feature_cols = [c for c in feature_cols if c in df_15m.columns]
         else:
             # Step 1: Load data
@@ -353,20 +411,23 @@ def main():
             # Step 3: Feature engineering
             df_15m, df_1h, df_4h = step_3_engineer_features(df_15m, df_1h, df_4h, config)
 
-            # Step 4: Train Analyst
+            # Filter feature columns to available ones
+            feature_cols = [c for c in feature_cols if c in df_15m.columns]
+
+            # Step 3b: NORMALIZE FEATURES (CRITICAL for neural network convergence)
+            df_15m, df_1h, df_4h, normalizer = step_3b_normalize_features(
+                df_15m, df_1h, df_4h, feature_cols, config
+            )
+
+            # Step 4: Train Analyst (on NORMALIZED data)
             if not args.skip_analyst:
                 analyst, feature_cols = step_4_train_analyst(
                     df_15m, df_1h, df_4h, config, device
                 )
                 del analyst  # Free memory
                 clear_memory()
-            else:
-                feature_cols = ['open', 'high', 'low', 'close', 'atr',
-                               'pinbar', 'engulfing', 'doji', 'ema_trend',
-                               'regime', 'returns', 'volatility']
-                feature_cols = [c for c in feature_cols if c in df_15m.columns]
 
-            # Step 5: Train Agent
+            # Step 5: Train Agent (on NORMALIZED data)
             if not args.skip_agent:
                 agent = step_5_train_agent(
                     df_15m, df_1h, df_4h, feature_cols, config, device
