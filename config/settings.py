@@ -73,11 +73,11 @@ class DataConfig:
     raw_file: str = "eurusd_m1_5y_part2_no_gaps.csv"
     datetime_format: str = "%Y-%m-%d %H:%M:%S"
 
-    # Timeframes
+    # Timeframes (use lowercase 'h' for pandas 2.0+ compatibility)
     timeframes: Dict[str, str] = field(default_factory=lambda: {
         '15m': '15min',
-        '1h': '1H',
-        '4h': '4H'
+        '1h': '1h',
+        '4h': '4h'
     })
 
     # Lookback windows (number of candles)

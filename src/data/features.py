@@ -335,7 +335,12 @@ def choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high_max = df['high'].rolling(window=period).max()
     low_min = df['low'].rolling(window=period).min()
 
-    chop = 100 * np.log10(atr_sum / (high_max - low_min + 1e-10)) / np.log10(period)
+    # Prevent division by zero and log of zero
+    range_diff = (high_max - low_min).replace(0, 1e-10)
+    ratio = atr_sum / range_diff
+    ratio = ratio.clip(lower=1e-10)  # Prevent log(0)
+
+    chop = 100 * np.log10(ratio) / np.log10(period)
 
     return chop.astype(np.float32)
 
