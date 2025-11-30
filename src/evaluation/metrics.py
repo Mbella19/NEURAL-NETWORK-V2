@@ -64,21 +64,25 @@ def calculate_sharpe_ratio(
 def calculate_sortino_ratio(
     returns: np.ndarray,
     risk_free_rate: float = 0.0,
-    periods_per_year: int = 252 * 96
+    periods_per_year: int = 252 * 96,
+    max_value: float = 100.0  # Cap to prevent inf in logs/comparisons
 ) -> float:
     """
     Calculate annualized Sortino Ratio.
 
     Uses downside deviation instead of standard deviation.
     Target: > 1.5
+    
+    FIXED: Returns capped value instead of inf to prevent issues in logging/comparison.
 
     Args:
         returns: Array of period returns
         risk_free_rate: Annual risk-free rate
         periods_per_year: Number of trading periods per year
+        max_value: Maximum return value (caps inf)
 
     Returns:
-        Annualized Sortino Ratio
+        Annualized Sortino Ratio (capped at max_value)
     """
     if len(returns) == 0:
         return 0.0
@@ -88,12 +92,14 @@ def calculate_sortino_ratio(
     downside_std = np.sqrt(np.mean(downside_returns ** 2))
 
     if downside_std == 0:
-        return float('inf') if np.mean(excess_returns) > 0 else 0.0
+        # FIXED: Return capped value instead of inf
+        return max_value if np.mean(excess_returns) > 0 else 0.0
 
     sortino = np.mean(excess_returns) / downside_std
 
-    # Annualize
-    return sortino * np.sqrt(periods_per_year)
+    # Annualize and cap
+    result = sortino * np.sqrt(periods_per_year)
+    return min(result, max_value)
 
 
 def calculate_max_drawdown(equity_curve: np.ndarray) -> Tuple[float, int, int]:

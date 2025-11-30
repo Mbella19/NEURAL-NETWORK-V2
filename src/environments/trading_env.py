@@ -64,7 +64,9 @@ class TradingEnv(gym.Env):
         chop_threshold: float = 60.0,
         max_steps: int = 2000,
         reward_scaling: float = 0.1,  # Scale PnL rewards to balance with penalties
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
+        market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
+        market_feat_std: Optional[np.ndarray] = None    # Pre-computed from training data
     ):
         """
         Initialize the trading environment.
@@ -140,8 +142,13 @@ class TradingEnv(gym.Env):
 
         # CRITICAL: Normalize market features to prevent scale inconsistencies!
         # Market features (ATR ~0.001, CHOP 0-100, ADX 0-100) have vastly different scales.
-        # Compute mean/std for normalization (fit on ALL data for simplicity in RL)
-        if len(market_features.shape) > 1 and market_features.shape[1] > 0:
+        # FIXED: Use pre-computed stats from training data to prevent look-ahead bias.
+        if market_feat_mean is not None and market_feat_std is not None:
+            # Use pre-computed statistics (no look-ahead bias)
+            self.market_feat_mean = market_feat_mean.astype(np.float32)
+            self.market_feat_std = market_feat_std.astype(np.float32)
+        elif len(market_features.shape) > 1 and market_features.shape[1] > 0:
+            # Fallback: compute from provided data (should only be used with training data)
             self.market_feat_mean = market_features.mean(axis=0).astype(np.float32)
             self.market_feat_std = market_features.std(axis=0).astype(np.float32)
             # Prevent division by zero for constant features
@@ -336,13 +343,14 @@ class TradingEnv(gym.Env):
         pip_value = 0.0001
 
         # Handle position changes
-        # NOTE: PnL rewards are scaled by self.reward_scaling to balance with penalties
-        # This prevents the agent from ignoring "Sniper" logic when potential PnL is high
+        # FIXED: Removed duplicate PnL rewards. Now using ONLY continuous pnl_delta rewards
+        # instead of exit-only rewards to prevent the "death spiral" problem.
+        # The exit PnL is NOT added separately - the sum of pnl_deltas equals the exit PnL.
         if direction == 0:  # Flat/Exit
             if self.position != 0:
-                # Close existing position
+                # Close existing position - record trade but DON'T add PnL reward here
+                # (it's already captured via continuous pnl_delta)
                 pnl = self._calculate_unrealized_pnl()
-                reward += pnl * self.reward_scaling  # Scaled PnL reward
                 info['trade_closed'] = True
                 info['pnl'] = pnl  # Unscaled for tracking
                 self.total_pnl += pnl
@@ -360,7 +368,6 @@ class TradingEnv(gym.Env):
         elif direction == 1:  # Long
             if self.position == -1:  # Close short first
                 pnl = self._calculate_unrealized_pnl()
-                reward += pnl * self.reward_scaling  # Scaled PnL reward
                 info['trade_closed'] = True
                 info['pnl'] = pnl
                 self.total_pnl += pnl
@@ -371,18 +378,21 @@ class TradingEnv(gym.Env):
                     'size': self.position_size,
                     'pnl': pnl
                 })
+                # Reset position state before opening new one
+                self.position = 0
+                self.position_size = 0.0
+                self.entry_price = 0.0
 
             if self.position != 1:  # Open long
                 self.position = 1
                 self.position_size = new_size
                 self.entry_price = current_price
-                reward -= self.spread_pips * new_size * self.reward_scaling  # Scaled cost
+                reward -= self.spread_pips * new_size * self.reward_scaling  # Spread cost
                 info['trade_opened'] = True
 
         elif direction == 2:  # Short
             if self.position == 1:  # Close long first
                 pnl = self._calculate_unrealized_pnl()
-                reward += pnl * self.reward_scaling  # Scaled PnL reward
                 info['trade_closed'] = True
                 info['pnl'] = pnl
                 self.total_pnl += pnl
@@ -393,24 +403,27 @@ class TradingEnv(gym.Env):
                     'size': self.position_size,
                     'pnl': pnl
                 })
+                # Reset position state before opening new one
+                self.position = 0
+                self.position_size = 0.0
+                self.entry_price = 0.0
 
             if self.position != -1:  # Open short
                 self.position = -1
                 self.position_size = new_size
                 self.entry_price = current_price
-                reward -= self.spread_pips * new_size * self.reward_scaling  # Scaled cost
+                reward -= self.spread_pips * new_size * self.reward_scaling  # Spread cost
                 info['trade_opened'] = True
 
-        # CRITICAL FIX: Add unrealized PnL change to prevent "death spiral"
-        # Without this, holding a profitable trade in chop accumulates penalties
-        # while getting NO reward until exit (e.g., -10.0 penalties vs +2.0 exit reward)
-        # With this: agent gets continuous feedback on whether position is profitable
+        # Continuous PnL feedback: reward based on CHANGE in unrealized PnL each step.
+        # This prevents the "death spiral" where holding in chop accumulates penalties
+        # with no offsetting reward until exit.
+        # FIXED: This is now the ONLY source of PnL reward (no duplicate on exit).
         current_unrealized_pnl = self._calculate_unrealized_pnl()
         pnl_delta = current_unrealized_pnl - self.prev_unrealized_pnl
 
         if self.position != 0:
             # Add the CHANGE in unrealized PnL to reward each step
-            # This balances chop/FOMO penalties with actual trade performance
             reward += pnl_delta * self.reward_scaling
             info['unrealized_pnl'] = current_unrealized_pnl
             info['pnl_delta'] = pnl_delta

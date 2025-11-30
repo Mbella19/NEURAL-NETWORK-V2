@@ -89,7 +89,12 @@ class Backtester:
         self.positions_history = []
 
     def _calculate_pnl_pips(self, exit_price: float) -> float:
-        """Calculate PnL in pips for current position."""
+        """
+        Calculate PnL in pips for current position.
+        
+        FIXED: Returns raw pips without position_size multiplication.
+        Position size is applied in _close_position for dollar conversion.
+        """
         if self.position == 0:
             return 0.0
 
@@ -98,19 +103,24 @@ class Backtester:
         else:  # Short
             pnl = (self.entry_price - exit_price) / self.pip_value
 
-        return pnl * self.position_size
+        return pnl  # Raw pips, not multiplied by position_size
 
     def _close_position(
         self,
         exit_price: float,
         exit_time: pd.Timestamp
     ) -> float:
-        """Close current position and record trade."""
+        """
+        Close current position and record trade.
+        
+        FIXED: Position size is now correctly applied only once for dollar conversion.
+        """
         if self.position == 0:
             return 0.0
 
-        pnl_pips = self._calculate_pnl_pips(exit_price)
-        pnl_dollars = pnl_pips * 10 * self.position_size  # $10 per pip per lot
+        pnl_pips_raw = self._calculate_pnl_pips(exit_price)  # Raw pips
+        pnl_pips_sized = pnl_pips_raw * self.position_size   # Adjusted for position size
+        pnl_dollars = pnl_pips_sized * 10  # $10 per pip per lot
 
         # Record trade
         trade = TradeRecord(
@@ -120,7 +130,7 @@ class Backtester:
             exit_price=exit_price,
             direction=self.position,
             size=self.position_size,
-            pnl_pips=pnl_pips,
+            pnl_pips=pnl_pips_sized,  # Store sized pips for consistency
             pnl_percent=(pnl_dollars / self.balance) * 100
         )
         self.trades.append(trade)
@@ -134,7 +144,7 @@ class Backtester:
         self.entry_price = 0.0
         self.entry_time = None
 
-        return pnl_pips
+        return pnl_pips_sized  # Return sized pips for consistency
 
     def _open_position(
         self,

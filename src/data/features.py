@@ -185,10 +185,15 @@ def detect_fractals(
 
         # Mark at CURRENT position (i), indicating we NOW KNOW about this fractal
         # The actual S/R level is at df['high'].iloc[fractal_idx]
-        if candidate_high == window_high.max() and candidate_high > window_high.iloc[0] and candidate_high > window_high.iloc[-1]:
+        # FIXED: Use tolerance-based comparison to handle float precision issues
+        if (abs(candidate_high - window_high.max()) < 1e-10 and 
+            candidate_high > window_high.iloc[0] and 
+            candidate_high > window_high.iloc[-1]):
             fractal_highs.iloc[i] = True
 
-        if candidate_low == window_low.min() and candidate_low < window_low.iloc[0] and candidate_low < window_low.iloc[-1]:
+        if (abs(candidate_low - window_low.min()) < 1e-10 and 
+            candidate_low < window_low.iloc[0] and 
+            candidate_low < window_low.iloc[-1]):
             fractal_lows.iloc[i] = True
 
     return fractal_highs, fractal_lows
@@ -319,9 +324,13 @@ def sma_distance(
 
     Positive = price above SMA (bullish)
     Negative = price below SMA (bearish)
+    
+    FIXED: Added clipping to prevent extreme values when ATR is near zero.
     """
     sma_val = sma(df, period)
     distance = (df['close'] - sma_val) / atr.replace(0, 1e-10)
+    # Clip to prevent extreme values
+    distance = distance.clip(-100, 100)
     return distance.astype(np.float32)
 
 
@@ -397,16 +406,28 @@ def choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
     Values > 61.8 indicate ranging/choppy market.
     Values < 38.2 indicate trending market.
+    
+    FIXED: Now uses raw True Range instead of averaged ATR.
     """
-    atr_val = atr(df, 1)  # True Range for each bar
-    atr_sum = atr_val.rolling(window=period).sum()
+    # Calculate raw True Range (not averaged)
+    high = df['high']
+    low = df['low']
+    close_prev = df['close'].shift(1)
+    
+    tr1 = high - low
+    tr2 = abs(high - close_prev)
+    tr3 = abs(low - close_prev)
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # Sum of True Range over period
+    tr_sum = true_range.rolling(window=period).sum()
 
     high_max = df['high'].rolling(window=period).max()
     low_min = df['low'].rolling(window=period).min()
 
     # Prevent division by zero and log of zero
     range_diff = (high_max - low_min).replace(0, 1e-10)
-    ratio = atr_sum / range_diff
+    ratio = tr_sum / range_diff
     ratio = ratio.clip(lower=1e-10)  # Prevent log(0)
 
     chop = 100 * np.log10(ratio) / np.log10(period)
@@ -420,6 +441,8 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
     Values > 25 indicate trending market.
     Values < 20 indicate ranging market.
+    
+    FIXED: Corrected pandas assignment bug for +DM/-DM calculation.
     """
     high = df['high']
     low = df['low']
@@ -429,11 +452,20 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     up_move = high - high.shift(1)
     down_move = low.shift(1) - low
 
-    plus_dm = pd.Series(0.0, index=df.index)
-    minus_dm = pd.Series(0.0, index=df.index)
-
-    plus_dm[(up_move > down_move) & (up_move > 0)] = up_move
-    minus_dm[(down_move > up_move) & (down_move > 0)] = down_move
+    # FIXED: Use np.where for proper conditional assignment
+    plus_dm_values = np.where(
+        (up_move > down_move) & (up_move > 0),
+        up_move,
+        0.0
+    )
+    minus_dm_values = np.where(
+        (down_move > up_move) & (down_move > 0),
+        down_move,
+        0.0
+    )
+    
+    plus_dm = pd.Series(plus_dm_values, index=df.index, dtype=np.float32)
+    minus_dm = pd.Series(minus_dm_values, index=df.index, dtype=np.float32)
 
     # True Range
     atr_val = atr(df, period)
@@ -561,6 +593,8 @@ def create_smoothed_target(
     Target = (smoothed future close / current close) - 1
 
     This teaches the model sustained momentum, not noise.
+    
+    FIXED: Added min_periods=1 to reduce NaN data loss at edges.
 
     Args:
         df: DataFrame with 'close' column
@@ -570,7 +604,8 @@ def create_smoothed_target(
     Returns:
         Series of target values
     """
-    future_smoothed = df['close'].shift(-future_window).rolling(smooth_window).mean()
+    # Use min_periods=1 to reduce NaN values at the edges
+    future_smoothed = df['close'].shift(-future_window).rolling(smooth_window, min_periods=1).mean()
     target = (future_smoothed / df['close']) - 1
 
     return target.astype(np.float32)

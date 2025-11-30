@@ -47,9 +47,12 @@ class MultiTimeframeDataset(Dataset):
 
     Each sample contains:
     - 15m features with lookback window
-    - 1H features with lookback window
-    - 4H features with lookback window
+    - 1H features with lookback window (subsampled from aligned 15m index)
+    - 4H features with lookback window (subsampled from aligned 15m index)
     - Smoothed future return target
+    
+    FIXED: 1H and 4H lookbacks now correctly subsample from the aligned data
+    to get the proper temporal coverage (24 hours of 1H = 24 candles, not 24 indices).
     """
 
     def __init__(
@@ -66,15 +69,21 @@ class MultiTimeframeDataset(Dataset):
         """
         Args:
             df_15m: 15-minute DataFrame
-            df_1h: 1-hour DataFrame (aligned to 15m index)
-            df_4h: 4-hour DataFrame (aligned to 15m index)
+            df_1h: 1-hour DataFrame (aligned to 15m index via ffill)
+            df_4h: 4-hour DataFrame (aligned to 15m index via ffill)
             feature_cols: Feature columns to use
             target: Smoothed future return target
-            lookback_*: Lookback windows for each timeframe
+            lookback_15m: Number of 15m candles (48 = 12 hours)
+            lookback_1h: Number of 1H candles to look back (24 = 24 hours)
+            lookback_4h: Number of 4H candles to look back (12 = 48 hours)
         """
         self.lookback_15m = lookback_15m
         self.lookback_1h = lookback_1h
         self.lookback_4h = lookback_4h
+        
+        # Subsampling ratios: how many 15m bars per higher TF bar
+        self.subsample_1h = 4   # 4 x 15m = 1H
+        self.subsample_4h = 16  # 16 x 15m = 4H
 
         # Get feature matrices
         self.features_15m = df_15m[feature_cols].values.astype(np.float32)
@@ -82,12 +91,21 @@ class MultiTimeframeDataset(Dataset):
         self.features_4h = df_4h[feature_cols].values.astype(np.float32)
         self.targets = target.values.astype(np.float32)
 
-        # Valid indices (need enough lookback and valid target)
-        self.start_idx = max(lookback_15m, lookback_1h * 4, lookback_4h * 16)
+        # FIXED: Calculate start index based on actual temporal coverage needed
+        # For 1H lookback: need lookback_1h * 4 indices (since data is aligned to 15m)
+        # For 4H lookback: need lookback_4h * 16 indices
+        self.start_idx = max(
+            lookback_15m,
+            lookback_1h * self.subsample_1h,
+            lookback_4h * self.subsample_4h
+        )
         self.valid_mask = ~np.isnan(self.targets[self.start_idx:])
         self.valid_indices = np.where(self.valid_mask)[0] + self.start_idx
 
         logger.info(f"Dataset created with {len(self.valid_indices)} valid samples")
+        logger.info(f"  15m lookback: {lookback_15m} bars = {lookback_15m * 15 / 60:.1f} hours")
+        logger.info(f"  1H lookback: {lookback_1h} bars = {lookback_1h} hours (using {lookback_1h * self.subsample_1h} aligned indices)")
+        logger.info(f"  4H lookback: {lookback_4h} bars = {lookback_4h * 4} hours (using {lookback_4h * self.subsample_4h} aligned indices)")
 
     def __len__(self) -> int:
         return len(self.valid_indices)
@@ -95,10 +113,18 @@ class MultiTimeframeDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         actual_idx = self.valid_indices[idx]
 
-        # Get lookback windows
+        # Get 15m lookback window (direct indexing)
         x_15m = self.features_15m[actual_idx - self.lookback_15m:actual_idx]
-        x_1h = self.features_1h[actual_idx - self.lookback_1h:actual_idx]
-        x_4h = self.features_4h[actual_idx - self.lookback_4h:actual_idx]
+        
+        # FIXED: Get 1H lookback by subsampling every 4th bar from aligned data
+        # This gives us lookback_1h actual 1H candles worth of data
+        idx_range_1h = range(actual_idx - self.lookback_1h * self.subsample_1h, actual_idx, self.subsample_1h)
+        x_1h = self.features_1h[list(idx_range_1h)]
+        
+        # FIXED: Get 4H lookback by subsampling every 16th bar from aligned data
+        # This gives us lookback_4h actual 4H candles worth of data
+        idx_range_4h = range(actual_idx - self.lookback_4h * self.subsample_4h, actual_idx, self.subsample_4h)
+        x_4h = self.features_4h[list(idx_range_4h)]
 
         # Target
         y = self.targets[actual_idx]

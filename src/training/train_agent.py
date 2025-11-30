@@ -63,6 +63,7 @@ class AgentTrainingLogger(BaseCallback):
         self.episode_trades: List[int] = []
         self.episode_win_rates: List[float] = []
         self.action_counts = {0: 0, 1: 0, 2: 0}  # Flat, Long, Short
+        self.size_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # Position sizes: 0.25, 0.5, 0.75, 1.0
         self.timestep_rewards: List[float] = []
 
         # Current episode tracking
@@ -93,12 +94,23 @@ class AgentTrainingLogger(BaseCallback):
             self.current_ep_reward += reward
             self.current_ep_length += 1
 
-        # Track actions
+        # Track actions (direction and size for MultiDiscrete)
         if len(self.locals.get('actions', [])) > 0:
             action = self.locals['actions'][0]
             if isinstance(action, np.ndarray):
-                action = action[0] if len(action) == 1 else action
-            if isinstance(action, (int, np.integer)):
+                if len(action) >= 2:
+                    # MultiDiscrete action: [direction, size]
+                    direction = int(action[0])
+                    size = int(action[1])
+                    self.action_counts[direction] = self.action_counts.get(direction, 0) + 1
+                    self.size_counts[size] = self.size_counts.get(size, 0) + 1
+                    self.current_ep_actions.append(direction)
+                else:
+                    # Single action (fallback)
+                    direction = int(action[0]) if len(action) == 1 else int(action)
+                    self.action_counts[direction] = self.action_counts.get(direction, 0) + 1
+                    self.current_ep_actions.append(direction)
+            elif isinstance(action, (int, np.integer)):
                 self.action_counts[int(action)] = self.action_counts.get(int(action), 0) + 1
                 self.current_ep_actions.append(int(action))
 
@@ -387,7 +399,9 @@ def create_trading_env(
     market_features: np.ndarray,
     analyst_model: Optional[MarketAnalyst] = None,
     config: Optional[object] = None,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training
+    market_feat_std: Optional[np.ndarray] = None    # Pre-computed from training
 ) -> TradingEnv:
     """
     Create the trading environment.
@@ -440,7 +454,9 @@ def create_trading_env(
         chop_threshold=chop_threshold,
         max_steps=max_steps,
         reward_scaling=reward_scaling,
-        device=device
+        device=device,
+        market_feat_mean=market_feat_mean,
+        market_feat_std=market_feat_std
     )
 
     return env
@@ -536,13 +552,26 @@ def train_agent(
         market_features[split_idx:]
     )
 
+    # Compute market feature normalization stats from TRAINING data only
+    # FIXED: This prevents look-ahead bias by using only training statistics
+    train_market_features = train_data[4]  # market_features from train_data tuple
+    market_feat_mean = train_market_features.mean(axis=0).astype(np.float32)
+    market_feat_std = train_market_features.std(axis=0).astype(np.float32)
+    market_feat_std = np.where(market_feat_std > 1e-8, market_feat_std, 1.0).astype(np.float32)
+    
+    logger.info("Market feature normalization stats (from training data):")
+    logger.info(f"  Mean: {market_feat_mean}")
+    logger.info(f"  Std:  {market_feat_std}")
+
     # Create environments
     logger.info("Creating training environment...")
     train_env = create_trading_env(
         *train_data,
         analyst_model=analyst,
         config=config,
-        device=device
+        device=device,
+        market_feat_mean=market_feat_mean,
+        market_feat_std=market_feat_std
     )
 
     logger.info("Creating evaluation environment...")
@@ -550,7 +579,9 @@ def train_agent(
         *eval_data,
         analyst_model=analyst,
         config=config,
-        device=device
+        device=device,
+        market_feat_mean=market_feat_mean,  # Use TRAINING stats for eval too
+        market_feat_std=market_feat_std
     )
 
     # Log environment info

@@ -114,11 +114,14 @@ class AttentionFusion(nn.Module):
         output = self.norm2(output)
 
         # Adaptive gating: learn how much to use each timeframe
+        # FIXED: Use residual gating to preserve gradient flow
+        # Gate now modulates between [0.5, 1.0] instead of [0, 1] to prevent vanishing gradients
         gate_input = torch.cat([enc_15m, enc_1h, enc_4h], dim=1)
-        gate_weights = self.gate(gate_input)  # [batch, d_model]
+        gate_weights = self.gate(gate_input)  # [batch, d_model], sigmoid output [0, 1]
 
-        # Apply gate
-        output = output * gate_weights
+        # Apply gate with residual connection: output = output * (0.5 + 0.5 * gate)
+        # This ensures at least 50% of the signal passes through even with gate=0
+        output = output * (0.5 + 0.5 * gate_weights)
 
         return output
 
@@ -150,7 +153,8 @@ class AttentionFusion(nn.Module):
 
         gate_input = torch.cat([enc_15m, enc_1h, enc_4h], dim=1)
         gate_weights = self.gate(gate_input)
-        output = output * gate_weights
+        # FIXED: Use residual gating to preserve gradient flow
+        output = output * (0.5 + 0.5 * gate_weights)
 
         return output, attention_weights.squeeze(1)  # [batch, 2] weights for 1H and 4H
 
