@@ -347,15 +347,26 @@ def prepare_env_data(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Prepare windowed data for the trading environment.
+    
+    FIXED: 1H and 4H data now correctly subsampled from the aligned 15m index.
+    Since df_1h and df_4h are aligned to the 15m index via forward-fill,
+    we subsample every 4th bar for 1H and every 16th bar for 4H.
 
     Returns:
         Tuple of (data_15m, data_1h, data_4h, close_prices, market_features)
     """
-    # Calculate valid range
-    start_idx = max(lookback_15m, lookback_1h * 4, lookback_4h * 16)
+    # Subsampling ratios: how many 15m bars per higher TF bar
+    subsample_1h = 4   # 4 x 15m = 1H
+    subsample_4h = 16  # 16 x 15m = 4H
+    
+    # Calculate valid range - need enough indices for subsampled lookback
+    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
     n_samples = len(df_15m) - start_idx - 1
 
     logger.info(f"Preparing {n_samples} samples for environment")
+    logger.info(f"  15m: {lookback_15m} bars = {lookback_15m * 15 / 60:.1f} hours")
+    logger.info(f"  1H: {lookback_1h} bars = {lookback_1h} hours (using {lookback_1h * subsample_1h} aligned indices)")
+    logger.info(f"  4H: {lookback_4h} bars = {lookback_4h * 4} hours (using {lookback_4h * subsample_4h} aligned indices)")
 
     # Prepare windowed data
     data_15m = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
@@ -368,9 +379,16 @@ def prepare_env_data(
 
     for i in range(n_samples):
         actual_idx = start_idx + i
+        # 15m: direct indexing
         data_15m[i] = features_15m[actual_idx - lookback_15m:actual_idx]
-        data_1h[i] = features_1h[actual_idx - lookback_1h:actual_idx]
-        data_4h[i] = features_4h[actual_idx - lookback_4h:actual_idx]
+        
+        # FIXED: 1H - subsample every 4th bar from aligned data
+        idx_range_1h = list(range(actual_idx - lookback_1h * subsample_1h, actual_idx, subsample_1h))
+        data_1h[i] = features_1h[idx_range_1h]
+        
+        # FIXED: 4H - subsample every 16th bar from aligned data  
+        idx_range_4h = list(range(actual_idx - lookback_4h * subsample_4h, actual_idx, subsample_4h))
+        data_4h[i] = features_4h[idx_range_4h]
 
     # Close prices
     close_prices = df_15m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)

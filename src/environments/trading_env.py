@@ -364,6 +364,9 @@ class TradingEnv(gym.Env):
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
+                # CRITICAL FIX: Reset prev_unrealized_pnl to prevent incorrect
+                # pnl_delta on next trade (would be current - old_position_pnl)
+                self.prev_unrealized_pnl = 0.0
 
         elif direction == 1:  # Long
             if self.position == -1:  # Close short first
@@ -382,6 +385,7 @@ class TradingEnv(gym.Env):
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
+                self.prev_unrealized_pnl = 0.0  # CRITICAL: Reset for new position
 
             if self.position != 1:  # Open long
                 self.position = 1
@@ -407,6 +411,7 @@ class TradingEnv(gym.Env):
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
+                self.prev_unrealized_pnl = 0.0  # CRITICAL: Reset for new position
 
             if self.position != -1:  # Open short
                 self.position = -1
@@ -456,9 +461,11 @@ class TradingEnv(gym.Env):
         if options and 'start_idx' in options:
             self.current_idx = options['start_idx']
         else:
+            # FIXED: Ensure valid range for random start
+            max_start = max(self.start_idx + 1, self.end_idx - self.max_steps)
             self.current_idx = self.np_random.integers(
                 self.start_idx,
-                self.end_idx - self.max_steps
+                max_start
             )
 
         # Reset state
@@ -526,11 +533,13 @@ def create_env_from_dataframes(
 ) -> TradingEnv:
     """
     Factory function to create TradingEnv from DataFrames.
+    
+    FIXED: 1H and 4H data now correctly subsampled from the aligned 15m index.
 
     Args:
         df_15m: 15-minute DataFrame with features
-        df_1h: 1-hour DataFrame with features
-        df_4h: 4-hour DataFrame with features
+        df_1h: 1-hour DataFrame with features (aligned to 15m index)
+        df_4h: 4-hour DataFrame with features (aligned to 15m index)
         analyst_model: Trained Market Analyst
         feature_cols: Feature columns to use
         config: TradingConfig object
@@ -554,32 +563,44 @@ def create_env_from_dataframes(
         lookback_1h = getattr(config, 'lookback_1h', 24)
         lookback_4h = getattr(config, 'lookback_4h', 12)
 
-    # Prepare windowed data
-    n_samples = len(df_15m) - max(lookback_15m, lookback_1h * 4, lookback_4h * 16)
+    # Subsampling ratios: how many 15m bars per higher TF bar
+    subsample_1h = 4   # 4 x 15m = 1H
+    subsample_4h = 16  # 16 x 15m = 4H
+
+    # Calculate valid range - need enough indices for subsampled lookback
+    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
+    n_samples = len(df_15m) - start_idx
+
+    # Get feature arrays
+    features_15m = df_15m[feature_cols].values.astype(np.float32)
+    features_1h = df_1h[feature_cols].values.astype(np.float32)
+    features_4h = df_4h[feature_cols].values.astype(np.float32)
 
     # Create windows for each timeframe
-    data_15m = np.array([
-        df_15m[feature_cols].iloc[i:i + lookback_15m].values
-        for i in range(n_samples)
-    ], dtype=np.float32)
+    data_15m = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
+    data_1h = np.zeros((n_samples, lookback_1h, len(feature_cols)), dtype=np.float32)
+    data_4h = np.zeros((n_samples, lookback_4h, len(feature_cols)), dtype=np.float32)
 
-    data_1h = np.array([
-        df_1h[feature_cols].iloc[i:i + lookback_1h].values
-        for i in range(n_samples)
-    ], dtype=np.float32)
-
-    data_4h = np.array([
-        df_4h[feature_cols].iloc[i:i + lookback_4h].values
-        for i in range(n_samples)
-    ], dtype=np.float32)
+    for i in range(n_samples):
+        actual_idx = start_idx + i
+        # 15m: direct indexing
+        data_15m[i] = features_15m[actual_idx - lookback_15m:actual_idx]
+        
+        # FIXED: 1H - subsample every 4th bar from aligned data
+        idx_range_1h = list(range(actual_idx - lookback_1h * subsample_1h, actual_idx, subsample_1h))
+        data_1h[i] = features_1h[idx_range_1h]
+        
+        # FIXED: 4H - subsample every 16th bar from aligned data
+        idx_range_4h = list(range(actual_idx - lookback_4h * subsample_4h, actual_idx, subsample_4h))
+        data_4h[i] = features_4h[idx_range_4h]
 
     # Close prices for PnL
-    close_prices = df_15m['close'].values[lookback_15m:lookback_15m + n_samples].astype(np.float32)
+    close_prices = df_15m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)
 
     # Market features for reward shaping
     market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance']
     available_cols = [c for c in market_cols if c in df_15m.columns]
-    market_features = df_15m[available_cols].values[lookback_15m:lookback_15m + n_samples].astype(np.float32)
+    market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
 
     return TradingEnv(
         data_15m=data_15m,
