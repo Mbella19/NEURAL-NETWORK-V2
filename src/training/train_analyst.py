@@ -27,7 +27,13 @@ import gc
 import time
 
 from ..models.analyst import MarketAnalyst, create_analyst
-from ..data.features import create_smoothed_target, create_return_classes
+from ..data.features import (
+    create_smoothed_target, 
+    create_return_classes, 
+    add_market_sessions,
+    detect_fractals,
+    detect_structure_breaks
+)
 from ..utils.logging_config import TrainingLogger, get_logger
 from ..utils.metrics import (
     MetricsTracker,
@@ -997,7 +1003,7 @@ def train_analyst(
                f"{(valid_target < 0).mean()*100:.1f}% negative")
 
     # Convert to classification labels
-    thresholds = config.class_std_thresholds if hasattr(config, 'class_std_thresholds') else (-0.5, -0.1, 0.1, 0.5)
+    thresholds = config.class_std_thresholds if hasattr(config, 'class_std_thresholds') else (-0.5, -0.5, 0.5, 0.5)
     class_labels, class_meta = create_return_classes(
         target,
         class_std_thresholds=thresholds
@@ -1021,6 +1027,28 @@ def train_analyst(
         pct = count / total_labels * 100
         logger.info(f"  {int(idx)} ({name}): {count} samples ({pct:.1f}%)")
 
+    # Add Market Sessions
+    logger.info("Adding market session features...")
+    df_15m = add_market_sessions(df_15m)
+    df_1h = add_market_sessions(df_1h)
+    df_4h = add_market_sessions(df_4h)
+
+    # Add Structure Features (BOS/CHoCH)
+    logger.info("Adding structure features (BOS/CHoCH)...")
+    for df in [df_15m, df_1h, df_4h]:
+        f_high, f_low = detect_fractals(df)
+        struct_df = detect_structure_breaks(df, f_high, f_low)
+        for col in struct_df.columns:
+            df[col] = struct_df[col]
+
+    # Update feature columns if not already included
+    session_cols = ['session_asian', 'session_london', 'session_ny']
+    struct_cols = ['bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish']
+    
+    for col in session_cols + struct_cols:
+        if col not in feature_cols:
+            feature_cols.append(col)
+            
     # Create dataset
     logger.info("Creating dataset...")
     dataset = MultiTimeframeDataset(

@@ -69,13 +69,16 @@ class TradingEnv(gym.Env):
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
         pre_windowed: bool = True,  # FIXED: If True, data is already windowed (start_idx=0)
         # Risk Management
-        stop_loss_pips: float = 15.0,   # Auto-close if loss exceeds this (in pips)
-        take_profit_pips: float = 25.0, # Auto-close if profit exceeds this (in pips)
+        sl_atr_multiplier: float = 1.5, # Stop Loss = ATR * multiplier
+        tp_atr_multiplier: float = 3.0, # Take Profit = ATR * multiplier
         use_stop_loss: bool = True,     # Enable/disable stop-loss
         use_take_profit: bool = True,   # Enable/disable take-profit
         # Regime-balanced sampling
         regime_labels: Optional[np.ndarray] = None,  # 0=Bullish, 1=Ranging, 2=Bearish
-        use_regime_sampling: bool = True  # Sample episodes balanced across regimes
+        use_regime_sampling: bool = True,  # Sample episodes balanced across regimes
+        # Volatility Sizing
+        volatility_sizing: bool = True,  # Scale position size inversely to ATR
+        risk_pips_target: float = 15.0   # Reference risk for normalization (e.g. 15 pips)
     ):
         """
         Initialize the trading environment.
@@ -129,10 +132,15 @@ class TradingEnv(gym.Env):
         self.reward_scaling = reward_scaling  # Scale PnL to balance with penalties
 
         # Risk Management - Stop-Loss and Take-Profit
-        self.stop_loss_pips = stop_loss_pips
-        self.take_profit_pips = take_profit_pips
+        self.sl_atr_multiplier = sl_atr_multiplier
+        self.tp_atr_multiplier = tp_atr_multiplier
+        self.use_stop_loss = use_stop_loss
         self.use_stop_loss = use_stop_loss
         self.use_take_profit = use_take_profit
+        
+        # Volatility Sizing
+        self.volatility_sizing = volatility_sizing
+        self.risk_pips_target = risk_pips_target
 
         # Calculate valid range FIRST (needed for regime indices)
         # FIXED: If pre_windowed=True, data is already trimmed by prepare_env_data
@@ -396,13 +404,29 @@ class TradingEnv(gym.Env):
         trigger_reason = None
 
         # Check stop-loss (loss exceeds threshold)
-        if self.use_stop_loss and raw_pips < -self.stop_loss_pips:
+        # Get current ATR for dynamic risk management
+        if len(self.market_features.shape) > 1:
+            atr = self.market_features[self.current_idx, 0]
+        else:
+            atr = 0.001  # Default fallback
+
+        # Calculate dynamic SL/TP in pips
+        # ATR is in price units (e.g. 0.0020), pip_value is 0.0001
+        sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
+        tp_pips = (atr * self.tp_atr_multiplier) / 0.0001
+        
+        # Ensure minimum values (e.g. 5 pips) to prevent instant stop-outs in low vol
+        sl_pips = max(sl_pips, 5.0)
+        tp_pips = max(tp_pips, 5.0)
+
+        # Check stop-loss (loss exceeds threshold)
+        if self.use_stop_loss and raw_pips < -sl_pips:
             triggered = True
             trigger_reason = 'stop_loss'
             info['stop_loss_triggered'] = True
 
         # Check take-profit (profit exceeds threshold)
-        elif self.use_take_profit and raw_pips > self.take_profit_pips:
+        elif self.use_take_profit and raw_pips > tp_pips:
             triggered = True
             trigger_reason = 'take_profit'
             info['take_profit_triggered'] = True
@@ -450,7 +474,30 @@ class TradingEnv(gym.Env):
         """
         direction = action[0]  # 0=Flat, 1=Long, 2=Short
         size_idx = action[1]   # 0-3
-        new_size = self.POSITION_SIZES[size_idx]
+        base_size = self.POSITION_SIZES[size_idx]
+        
+        # Volatility Sizing: Adjust position size so that risk is constant
+        # If ATR is high (wide SL), size should be small.
+        # If ATR is low (tight SL), size should be large.
+        # Target: SL distance * Position Size ~= Constant
+        new_size = base_size
+        
+        if self.volatility_sizing and len(self.market_features.shape) > 1:
+            atr = self.market_features[self.current_idx, 0]
+            # Calculate SL pips for this ATR
+            sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
+            sl_pips = max(sl_pips, 5.0) # Minimum 5 pips
+            
+            # Calculate volatility scalar
+            # Example: Target=15, SL=30 (High Vol) -> Scalar = 0.5 -> Size halved
+            # Example: Target=15, SL=7.5 (Low Vol) -> Scalar = 2.0 -> Size doubled
+            vol_scalar = self.risk_pips_target / sl_pips
+            
+            # Apply scalar to base size
+            new_size = base_size * vol_scalar
+            
+            # Clip to reasonable limits (e.g. 0.1x to 5.0x) to prevent extreme leverage
+            new_size = np.clip(new_size, 0.1, 5.0)
 
         reward = 0.0
         info = {

@@ -824,12 +824,145 @@ def create_return_classes(
     return labels, meta
 
 
+# =============================================================================
+# Market Sessions
+# =============================================================================
+
+def add_market_sessions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add market session flags (London, NY, Asian).
+    
+    Assumes index is DatetimeIndex in UTC.
+    
+    Sessions (approx UTC):
+    - Asian: 00:00 - 09:00
+    - London: 08:00 - 17:00
+    - NY: 13:00 - 22:00
+    
+    Args:
+        df: DataFrame with DatetimeIndex
+        
+    Returns:
+        DataFrame with added session columns
+    """
+    df = df.copy()
+    
+    if not isinstance(df.index, pd.DatetimeIndex):
+        logger.warning("DataFrame index is not DatetimeIndex. Skipping session features.")
+        return df
+        
+    hours = df.index.hour
+    
+    # Asian Session (Tokyo/Sydney): ~00:00 to 09:00 UTC
+    df['session_asian'] = ((hours >= 0) & (hours < 9)).astype(int)
+    
+    # London Session: ~08:00 to 17:00 UTC
+    df['session_london'] = ((hours >= 8) & (hours < 17)).astype(int)
+    
+    # New York Session: ~13:00 to 22:00 UTC
+    df['session_ny'] = ((hours >= 13) & (hours < 22)).astype(int)
+    
+    return df
+
+
+def detect_structure_breaks(
+    df: pd.DataFrame,
+    fractal_highs: pd.Series,
+    fractal_lows: pd.Series,
+    n: int = 5
+) -> pd.DataFrame:
+    """
+    Detect Break of Structure (BOS) and Change of Character (CHoCH).
+    
+    Logic:
+    - Track most recent confirmed Swing High/Low (from fractals).
+    - Track current Structure Trend (Bullish/Bearish).
+    - BOS: Continuation break (e.g. Bullish Trend + Break High).
+    - CHoCH: Reversal break (e.g. Bearish Trend + Break High).
+    
+    Args:
+        df: OHLCV DataFrame
+        fractal_highs: Boolean series of confirmed fractal highs
+        fractal_lows: Boolean series of confirmed fractal lows
+        n: Window size used for fractal detection (to find price level)
+        
+    Returns:
+        DataFrame with columns: bos_bullish, bos_bearish, choch_bullish, choch_bearish
+    """
+    # Initialize result columns
+    results = pd.DataFrame(0, index=df.index, columns=[
+        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
+    ], dtype=np.int32)
+    
+    # State
+    last_high = np.nan
+    last_low = np.nan
+    last_high_broken = False
+    last_low_broken = False
+    
+    # Trend: 1=Bullish, -1=Bearish, 0=Unknown
+    trend = 0
+    
+    # Half window to find the actual fractal candle
+    half_n = n // 2
+    
+    # Iterate
+    # We can't vectorise easily because trend state depends on previous breaks
+    for i in range(len(df)):
+        # 1. Update Structure Points if a NEW fractal is confirmed NOW
+        if fractal_highs.iloc[i]:
+            # The fractal was at i - half_n
+            # But wait, fractal_highs[i] is True means we JUST confirmed it.
+            # So the level is valid from now on.
+            idx = i - half_n
+            if idx >= 0:
+                last_high = df['high'].iloc[idx]
+                last_high_broken = False # Reset break status for new level
+        
+        if fractal_lows.iloc[i]:
+            idx = i - half_n
+            if idx >= 0:
+                last_low = df['low'].iloc[idx]
+                last_low_broken = False # Reset break status for new level
+                
+        # 2. Check for Breaks
+        close = df['close'].iloc[i]
+        
+        # Break High
+        if not np.isnan(last_high) and not last_high_broken and close > last_high:
+            last_high_broken = True
+            
+            if trend == 1:
+                results.iloc[i, results.columns.get_loc('bos_bullish')] = 1
+            elif trend == -1:
+                results.iloc[i, results.columns.get_loc('choch_bullish')] = 1
+                trend = 1 # Reversal to Bullish
+            else:
+                trend = 1 # Initialize
+                
+        # Break Low
+        if not np.isnan(last_low) and not last_low_broken and close < last_low:
+            last_low_broken = True
+            
+            if trend == -1:
+                results.iloc[i, results.columns.get_loc('bos_bearish')] = 1
+            elif trend == 1:
+                results.iloc[i, results.columns.get_loc('choch_bearish')] = 1
+                trend = -1 # Reversal to Bearish
+            else:
+                trend = -1 # Initialize
+                
+    return results
+
+
 def get_feature_columns(include_ohlcv: bool = False) -> List[str]:
     """Get list of feature column names."""
     features = [
         'atr', 'pinbar', 'engulfing', 'doji',
         'sma_distance', 'ema_crossover', 'ema_trend',
-        'chop', 'adx', 'regime', 'returns', 'volatility'
+        'chop', 'adx', 'regime', 'returns', 'volatility',
+        'session_asian', 'session_london', 'session_ny',
+        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
     ]
     if include_ohlcv:
         features = ['open', 'high', 'low', 'close', 'volume'] + features

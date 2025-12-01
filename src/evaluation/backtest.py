@@ -53,18 +53,21 @@ class Backtester:
         pip_value: float = 0.0001,
         lot_size: float = 100000.0,  # Standard lot
         # Risk Management
-        stop_loss_pips: float = 15.0,
-        take_profit_pips: float = 25.0,
+        sl_atr_multiplier: float = 1.5,
+        tp_atr_multiplier: float = 3.0,
         use_stop_loss: bool = True,
-        use_take_profit: bool = True
+        use_take_profit: bool = True,
+        # Volatility Sizing
+        volatility_sizing: bool = True,
+        risk_per_trade: float = 100.0  # Dollar risk per trade
     ):
         """
         Args:
             initial_balance: Starting account balance
             pip_value: Pip value for EURUSD
             lot_size: Size of one standard lot
-            stop_loss_pips: Auto-close if loss exceeds this (in pips)
-            take_profit_pips: Auto-close if profit exceeds this (in pips)
+            sl_atr_multiplier: Stop Loss multiplier (SL = ATR * multiplier)
+            tp_atr_multiplier: Take Profit multiplier (TP = ATR * multiplier)
             use_stop_loss: Enable/disable stop-loss mechanism
             use_take_profit: Enable/disable take-profit mechanism
         """
@@ -73,10 +76,14 @@ class Backtester:
         self.lot_size = lot_size
 
         # Risk Management
-        self.stop_loss_pips = stop_loss_pips
-        self.take_profit_pips = take_profit_pips
+        self.sl_atr_multiplier = sl_atr_multiplier
+        self.tp_atr_multiplier = tp_atr_multiplier
         self.use_stop_loss = use_stop_loss
         self.use_take_profit = use_take_profit
+        
+        # Volatility Sizing
+        self.volatility_sizing = volatility_sizing
+        self.risk_per_trade = risk_per_trade
 
         # State
         self.balance = initial_balance
@@ -182,7 +189,8 @@ class Backtester:
     def _check_stop_loss_take_profit(
         self,
         price: float,
-        time: pd.Timestamp
+        time: pd.Timestamp,
+        atr: float = 0.001
     ) -> Tuple[float, str]:
         """
         Check and execute stop-loss or take-profit if triggered.
@@ -200,8 +208,16 @@ class Backtester:
         # Calculate raw pips (before position size)
         raw_pips = self._calculate_pnl_pips(price)
 
+        # Calculate dynamic SL/TP in pips
+        sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
+        tp_pips = (atr * self.tp_atr_multiplier) / 0.0001
+        
+        # Ensure minimum values
+        sl_pips = max(sl_pips, 5.0)
+        tp_pips = max(tp_pips, 5.0)
+
         # Check stop-loss (loss exceeds threshold)
-        if self.use_stop_loss and raw_pips < -self.stop_loss_pips:
+        if self.use_stop_loss and raw_pips < -sl_pips:
             pnl = self._close_position(price, time)
             # Mark the trade as stop-loss
             if self.trades:
@@ -218,7 +234,7 @@ class Backtester:
             return pnl, 'stop_loss'
 
         # Check take-profit (profit exceeds threshold)
-        if self.use_take_profit and raw_pips > self.take_profit_pips:
+        if self.use_take_profit and raw_pips > tp_pips:
             pnl = self._close_position(price, time)
             return pnl, 'take_profit'
 
@@ -229,6 +245,7 @@ class Backtester:
         action: np.ndarray,
         price: float,
         time: pd.Timestamp,
+        atr: float = 0.001,
         spread_pips: float = 1.5
     ) -> float:
         """
@@ -245,13 +262,32 @@ class Backtester:
         """
         direction = action[0]
         size_idx = action[1]
-        size = [0.25, 0.5, 0.75, 1.0][size_idx]
+        base_size_factor = [0.25, 0.5, 0.75, 1.0][size_idx]
+        
+        # Volatility Sizing: Calculate lot size based on risk
+        if self.volatility_sizing:
+            # Calculate SL distance in pips
+            sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
+            sl_pips = max(sl_pips, 5.0)
+            
+            # Risk Formula: Risk = Lots * 10 * SL_pips
+            # Lots = Risk / (10 * SL_pips)
+            # We use base_size_factor to scale the risk (e.g. 0.5x risk)
+            
+            risk_amount = self.risk_per_trade * base_size_factor
+            size = risk_amount / (10 * sl_pips)
+            
+            # Cap size to avoid crazy leverage in ultra-low vol
+            size = min(size, 50.0) # Max 50 lots
+        else:
+            # Fixed sizing (1 lot * factor)
+            size = 1.0 * base_size_factor
 
         pnl = 0.0
 
         # FIRST: Check stop-loss/take-profit BEFORE agent action
         # This enforces risk management regardless of what the agent wants to do
-        sl_tp_pnl, close_reason = self._check_stop_loss_take_profit(price, time)
+        sl_tp_pnl, close_reason = self._check_stop_loss_take_profit(price, time, atr)
         if sl_tp_pnl != 0.0:
             pnl += sl_tp_pnl
             # Position is now flat after SL/TP, agent can still open new position
@@ -310,8 +346,8 @@ def run_backtest(
     start_idx: Optional[int] = None,
     max_steps: Optional[int] = None,
     # Risk Management (defaults from config)
-    stop_loss_pips: float = 15.0,
-    take_profit_pips: float = 25.0,
+    sl_atr_multiplier: float = 1.5,
+    tp_atr_multiplier: float = 3.0,
     use_stop_loss: bool = True,
     use_take_profit: bool = True
 ) -> BacktestResult:
@@ -329,8 +365,8 @@ def run_backtest(
         deterministic: Use deterministic policy
         start_idx: Starting index (if None, uses env.start_idx for full coverage)
         max_steps: Max steps for episode (if None, uses remaining data length)
-        stop_loss_pips: Auto-close if loss exceeds this (in pips)
-        take_profit_pips: Auto-close if profit exceeds this (in pips)
+        sl_atr_multiplier: Stop Loss multiplier
+        tp_atr_multiplier: Take Profit multiplier
         use_stop_loss: Enable/disable stop-loss mechanism
         use_take_profit: Enable/disable take-profit mechanism
 
@@ -348,13 +384,13 @@ def run_backtest(
 
     logger.info(f"Backtest coverage: start_idx={start_idx}, max_steps={max_steps} "
                 f"({max_steps * 15 / 60 / 24:.1f} days of 15m data)")
-    logger.info(f"Risk Management: SL={stop_loss_pips} pips (enabled={use_stop_loss}), "
-                f"TP={take_profit_pips} pips (enabled={use_take_profit})")
+    logger.info(f"Risk Management: SL={sl_atr_multiplier}x ATR (enabled={use_stop_loss}), "
+                f"TP={tp_atr_multiplier}x ATR (enabled={use_take_profit})")
 
     backtester = Backtester(
         initial_balance=initial_balance,
-        stop_loss_pips=stop_loss_pips,
-        take_profit_pips=take_profit_pips,
+        sl_atr_multiplier=sl_atr_multiplier,
+        tp_atr_multiplier=tp_atr_multiplier,
         use_stop_loss=use_stop_loss,
         use_take_profit=use_take_profit
     )
@@ -383,8 +419,18 @@ def run_backtest(
         # Create timestamp (or use step number)
         time = pd.Timestamp.now() + pd.Timedelta(minutes=15 * step)
 
+        # Get ATR from environment (current index - 1 because step hasn't incremented yet for next obs?)
+        # Actually env.current_idx points to NEXT step, so current state is at current_idx-1
+        # But wait, env.step() increments current_idx. So after env.step(), current_idx is for NEXT step.
+        # The price we got is from env.close_prices[env.current_idx - 1].
+        # So we should use the same index for ATR.
+        
+        atr = 0.001
+        if hasattr(env, 'market_features') and len(env.market_features.shape) > 1:
+             atr = env.market_features[env.current_idx - 1, 0]
+
         # Step backtester
-        backtester.step(action, price, time)
+        backtester.step(action, price, time, atr=atr)
 
         step += 1
 

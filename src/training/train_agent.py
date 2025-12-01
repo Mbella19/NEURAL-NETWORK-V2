@@ -31,7 +31,12 @@ from ..environments.trading_env import TradingEnv
 from ..agents.sniper_agent import SniperAgent, create_agent
 from ..utils.logging_config import setup_logging, get_logger
 from ..utils.metrics import calculate_trading_metrics, TradingMetrics
-from ..data.features import compute_regime_labels
+from ..data.features import (
+    compute_regime_labels, 
+    add_market_sessions,
+    detect_fractals,
+    detect_structure_breaks
+)
 
 logger = get_logger(__name__)
 
@@ -456,10 +461,15 @@ def create_trading_env(
     context_dim = 64
     
     # Risk Management defaults
-    stop_loss_pips = 15.0
-    take_profit_pips = 25.0
+    sl_atr_multiplier = 1.5
+    tp_atr_multiplier = 3.0
+    use_stop_loss = True
     use_stop_loss = True
     use_take_profit = True
+    
+    # Volatility Sizing
+    volatility_sizing = True
+    risk_pips_target = 15.0
 
     if config is not None:
         spread_pips = getattr(config, 'spread_pips', spread_pips)
@@ -470,10 +480,14 @@ def create_trading_env(
         max_steps = getattr(config, 'max_steps_per_episode', max_steps)
         reward_scaling = getattr(config, 'reward_scaling', reward_scaling)
         # Risk Management
-        stop_loss_pips = getattr(config, 'stop_loss_pips', stop_loss_pips)
-        take_profit_pips = getattr(config, 'take_profit_pips', take_profit_pips)
+        sl_atr_multiplier = getattr(config, 'sl_atr_multiplier', sl_atr_multiplier)
+        tp_atr_multiplier = getattr(config, 'tp_atr_multiplier', tp_atr_multiplier)
+        use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
         use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
         use_take_profit = getattr(config, 'use_take_profit', use_take_profit)
+        # Volatility Sizing
+        volatility_sizing = getattr(config, 'volatility_sizing', volatility_sizing)
+        risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
@@ -497,13 +511,16 @@ def create_trading_env(
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
         # Risk Management
-        stop_loss_pips=stop_loss_pips,
-        take_profit_pips=take_profit_pips,
+        sl_atr_multiplier=sl_atr_multiplier,
+        tp_atr_multiplier=tp_atr_multiplier,
         use_stop_loss=use_stop_loss,
         use_take_profit=use_take_profit,
         # Regime-balanced sampling
         regime_labels=regime_labels,
-        use_regime_sampling=use_regime_sampling
+        use_regime_sampling=use_regime_sampling,
+        # Volatility Sizing
+        volatility_sizing=volatility_sizing,
+        risk_pips_target=risk_pips_target
     )
 
     return env
@@ -567,6 +584,29 @@ def train_agent(
 
     # Prepare data
     logger.info("Preparing environment data...")
+    
+    # Add Market Sessions
+    logger.info("Adding market session features...")
+    df_15m = add_market_sessions(df_15m)
+    df_1h = add_market_sessions(df_1h)
+    df_4h = add_market_sessions(df_4h)
+
+    # Add Structure Features (BOS/CHoCH)
+    logger.info("Adding structure features (BOS/CHoCH)...")
+    for df in [df_15m, df_1h, df_4h]:
+        f_high, f_low = detect_fractals(df)
+        struct_df = detect_structure_breaks(df, f_high, f_low)
+        for col in struct_df.columns:
+            df[col] = struct_df[col]
+
+    # Update feature columns if not already included
+    session_cols = ['session_asian', 'session_london', 'session_ny']
+    struct_cols = ['bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish']
+    
+    for col in session_cols + struct_cols:
+        if col not in feature_cols:
+            feature_cols.append(col)
+
     lookback_15m = 48
     lookback_1h = 24
     lookback_4h = 12
