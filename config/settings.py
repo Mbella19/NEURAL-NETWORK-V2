@@ -72,6 +72,7 @@ class DataConfig:
     # Data file names
     raw_file: str = "eurusd_m1_20220101_20251130.csv"
     processed_file: str = "eurusd_processed.parquet"
+    datetime_format: str = "ISO8601"  # Auto-detect or ISO format
 
     # Timeframes (use lowercase 'h' for pandas 2.0+ compatibility)
     timeframes: Dict[str, str] = field(default_factory=lambda: {
