@@ -60,6 +60,10 @@ class MarketAnalyst(nn.Module):
         super().__init__()
 
         self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.dim_feedforward = dim_feedforward
+        self.dropout = dropout
         self.context_dim = context_dim
         self.num_classes = num_classes
 
