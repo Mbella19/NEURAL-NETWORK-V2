@@ -447,8 +447,15 @@ class AnalystTrainer:
         if class_weights is not None:
             class_weights = class_weights.to(device)
 
-        # Multi-class classification loss with class weights
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+        # FocalLoss to address class oscillation issue
+        # - gamma=2.0: Down-weights easy examples, focuses on hard Up/Down distinctions
+        # - label_smoothing=0.1: Softens noisy boundaries in financial data
+        # This replaces CrossEntropyLoss which caused oscillation between Up/Down bias
+        self.criterion = FocalLoss(
+            weight=class_weights,
+            gamma=2.0,
+            label_smoothing=0.1
+        )
 
         # Training history
         self.train_losses = []

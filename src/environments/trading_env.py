@@ -351,49 +351,60 @@ class TradingEnv(gym.Env):
         pip_value = 0.0001
 
         # Handle position changes
-        # FIXED: Removed duplicate PnL rewards. Now using ONLY continuous pnl_delta rewards
-        # instead of exit-only rewards to prevent the "death spiral" problem.
-        # The exit PnL is NOT added separately - the sum of pnl_deltas equals the exit PnL.
+        # Reward structure: Continuous pnl_delta rewards every step.
+        # On exit: The final delta (last price leg) is captured BEFORE resetting position
+        # to ensure the agent receives complete reward signal for the entire trade.
         if direction == 0:  # Flat/Exit
             if self.position != 0:
-                # Close existing position - record trade but DON'T add PnL reward here
-                # (it's already captured via continuous pnl_delta)
-                pnl = self._calculate_unrealized_pnl()
+                # CRITICAL: Calculate final delta BEFORE resetting position
+                # This captures the last price leg that would otherwise be missed
+                final_unrealized = self._calculate_unrealized_pnl()
+                final_delta = final_unrealized - self.prev_unrealized_pnl
+                reward += final_delta * self.reward_scaling  # Capture final leg!
+                
+                # Record trade statistics
                 info['trade_closed'] = True
-                info['pnl'] = pnl  # Unscaled for tracking
-                self.total_pnl += pnl
+                info['pnl'] = final_unrealized  # Unscaled for tracking
+                info['pnl_delta'] = final_delta
+                self.total_pnl += final_unrealized
                 self.trades.append({
                     'entry': self.entry_price,
                     'exit': current_price,
                     'direction': self.position,
                     'size': self.position_size,
-                    'pnl': pnl
+                    'pnl': final_unrealized
                 })
+                
+                # NOW reset position state
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
-                # CRITICAL FIX: Reset prev_unrealized_pnl to prevent incorrect
-                # pnl_delta on next trade (would be current - old_position_pnl)
                 self.prev_unrealized_pnl = 0.0
 
         elif direction == 1:  # Long
             if self.position == -1:  # Close short first
-                pnl = self._calculate_unrealized_pnl()
+                # CRITICAL: Calculate final delta BEFORE resetting position
+                final_unrealized = self._calculate_unrealized_pnl()
+                final_delta = final_unrealized - self.prev_unrealized_pnl
+                reward += final_delta * self.reward_scaling  # Capture final leg!
+                
                 info['trade_closed'] = True
-                info['pnl'] = pnl
-                self.total_pnl += pnl
+                info['pnl'] = final_unrealized
+                info['pnl_delta'] = final_delta
+                self.total_pnl += final_unrealized
                 self.trades.append({
                     'entry': self.entry_price,
                     'exit': current_price,
                     'direction': -1,
                     'size': self.position_size,
-                    'pnl': pnl
+                    'pnl': final_unrealized
                 })
-                # Reset position state before opening new one
+                
+                # NOW reset position state before opening new one
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
-                self.prev_unrealized_pnl = 0.0  # CRITICAL: Reset for new position
+                self.prev_unrealized_pnl = 0.0
 
             if self.position != 1:  # Open long
                 self.position = 1
@@ -404,22 +415,28 @@ class TradingEnv(gym.Env):
 
         elif direction == 2:  # Short
             if self.position == 1:  # Close long first
-                pnl = self._calculate_unrealized_pnl()
+                # CRITICAL: Calculate final delta BEFORE resetting position
+                final_unrealized = self._calculate_unrealized_pnl()
+                final_delta = final_unrealized - self.prev_unrealized_pnl
+                reward += final_delta * self.reward_scaling  # Capture final leg!
+                
                 info['trade_closed'] = True
-                info['pnl'] = pnl
-                self.total_pnl += pnl
+                info['pnl'] = final_unrealized
+                info['pnl_delta'] = final_delta
+                self.total_pnl += final_unrealized
                 self.trades.append({
                     'entry': self.entry_price,
                     'exit': current_price,
                     'direction': 1,
                     'size': self.position_size,
-                    'pnl': pnl
+                    'pnl': final_unrealized
                 })
-                # Reset position state before opening new one
+                
+                # NOW reset position state before opening new one
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
-                self.prev_unrealized_pnl = 0.0  # CRITICAL: Reset for new position
+                self.prev_unrealized_pnl = 0.0
 
             if self.position != -1:  # Open short
                 self.position = -1
