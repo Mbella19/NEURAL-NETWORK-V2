@@ -192,7 +192,7 @@ class MarketAnalyst(nn.Module):
         context = self.context_proj(fused)  # [batch, context_dim]
 
         # Predict trend
-        prediction = self.trend_head(context)  # [batch, 1]
+        prediction = self.trend_head(context)  # [batch, num_classes]
 
         return context, prediction
 

@@ -51,17 +51,32 @@ class Backtester:
         self,
         initial_balance: float = 10000.0,
         pip_value: float = 0.0001,
-        lot_size: float = 100000.0  # Standard lot
+        lot_size: float = 100000.0,  # Standard lot
+        # Risk Management
+        stop_loss_pips: float = 15.0,
+        take_profit_pips: float = 25.0,
+        use_stop_loss: bool = True,
+        use_take_profit: bool = True
     ):
         """
         Args:
             initial_balance: Starting account balance
             pip_value: Pip value for EURUSD
             lot_size: Size of one standard lot
+            stop_loss_pips: Auto-close if loss exceeds this (in pips)
+            take_profit_pips: Auto-close if profit exceeds this (in pips)
+            use_stop_loss: Enable/disable stop-loss mechanism
+            use_take_profit: Enable/disable take-profit mechanism
         """
         self.initial_balance = initial_balance
         self.pip_value = pip_value
         self.lot_size = lot_size
+
+        # Risk Management
+        self.stop_loss_pips = stop_loss_pips
+        self.take_profit_pips = take_profit_pips
+        self.use_stop_loss = use_stop_loss
+        self.use_take_profit = use_take_profit
 
         # State
         self.balance = initial_balance
@@ -164,6 +179,51 @@ class Backtester:
         spread_cost = spread_pips * 10 * size  # $10 per pip
         self.balance -= spread_cost
 
+    def _check_stop_loss_take_profit(
+        self,
+        price: float,
+        time: pd.Timestamp
+    ) -> Tuple[float, str]:
+        """
+        Check and execute stop-loss or take-profit if triggered.
+
+        Args:
+            price: Current price
+            time: Current timestamp
+
+        Returns:
+            Tuple of (pnl_pips, close_reason) if triggered, (0, None) otherwise
+        """
+        if self.position == 0:
+            return 0.0, None
+
+        # Calculate raw pips (before position size)
+        raw_pips = self._calculate_pnl_pips(price)
+
+        # Check stop-loss (loss exceeds threshold)
+        if self.use_stop_loss and raw_pips < -self.stop_loss_pips:
+            pnl = self._close_position(price, time)
+            # Mark the trade as stop-loss
+            if self.trades:
+                self.trades[-1] = TradeRecord(
+                    entry_time=self.trades[-1].entry_time,
+                    exit_time=self.trades[-1].exit_time,
+                    entry_price=self.trades[-1].entry_price,
+                    exit_price=self.trades[-1].exit_price,
+                    direction=self.trades[-1].direction,
+                    size=self.trades[-1].size,
+                    pnl_pips=self.trades[-1].pnl_pips,
+                    pnl_percent=self.trades[-1].pnl_percent,
+                )
+            return pnl, 'stop_loss'
+
+        # Check take-profit (profit exceeds threshold)
+        if self.use_take_profit and raw_pips > self.take_profit_pips:
+            pnl = self._close_position(price, time)
+            return pnl, 'take_profit'
+
+        return 0.0, None
+
     def step(
         self,
         action: np.ndarray,
@@ -189,20 +249,27 @@ class Backtester:
 
         pnl = 0.0
 
-        # Handle action
+        # FIRST: Check stop-loss/take-profit BEFORE agent action
+        # This enforces risk management regardless of what the agent wants to do
+        sl_tp_pnl, close_reason = self._check_stop_loss_take_profit(price, time)
+        if sl_tp_pnl != 0.0:
+            pnl += sl_tp_pnl
+            # Position is now flat after SL/TP, agent can still open new position
+
+        # Handle agent's action
         if direction == 0:  # Flat/Exit
             if self.position != 0:
-                pnl = self._close_position(price, time)
+                pnl += self._close_position(price, time)
 
         elif direction == 1:  # Long
             if self.position == -1:  # Close short first
-                pnl = self._close_position(price, time)
+                pnl += self._close_position(price, time)
             if self.position == 0:  # Open long
                 self._open_position(1, size, price, time, spread_pips)
 
         elif direction == 2:  # Short
             if self.position == 1:  # Close long first
-                pnl = self._close_position(price, time)
+                pnl += self._close_position(price, time)
             if self.position == 0:  # Open short
                 self._open_position(-1, size, price, time, spread_pips)
 
@@ -241,7 +308,12 @@ def run_backtest(
     initial_balance: float = 10000.0,
     deterministic: bool = True,
     start_idx: Optional[int] = None,
-    max_steps: Optional[int] = None
+    max_steps: Optional[int] = None,
+    # Risk Management (defaults from config)
+    stop_loss_pips: float = 15.0,
+    take_profit_pips: float = 25.0,
+    use_stop_loss: bool = True,
+    use_take_profit: bool = True
 ) -> BacktestResult:
     """
     Run a full backtest with the trained agent.
@@ -257,6 +329,10 @@ def run_backtest(
         deterministic: Use deterministic policy
         start_idx: Starting index (if None, uses env.start_idx for full coverage)
         max_steps: Max steps for episode (if None, uses remaining data length)
+        stop_loss_pips: Auto-close if loss exceeds this (in pips)
+        take_profit_pips: Auto-close if profit exceeds this (in pips)
+        use_stop_loss: Enable/disable stop-loss mechanism
+        use_take_profit: Enable/disable take-profit mechanism
 
     Returns:
         BacktestResult with all metrics and trades
@@ -272,8 +348,16 @@ def run_backtest(
 
     logger.info(f"Backtest coverage: start_idx={start_idx}, max_steps={max_steps} "
                 f"({max_steps * 15 / 60 / 24:.1f} days of 15m data)")
+    logger.info(f"Risk Management: SL={stop_loss_pips} pips (enabled={use_stop_loss}), "
+                f"TP={take_profit_pips} pips (enabled={use_take_profit})")
 
-    backtester = Backtester(initial_balance=initial_balance)
+    backtester = Backtester(
+        initial_balance=initial_balance,
+        stop_loss_pips=stop_loss_pips,
+        take_profit_pips=take_profit_pips,
+        use_stop_loss=use_stop_loss,
+        use_take_profit=use_take_profit
+    )
     backtester.reset()
 
     # Temporarily override env.max_steps for full test coverage

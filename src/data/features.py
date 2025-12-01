@@ -428,7 +428,10 @@ def choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
     # Prevent division by zero and log of zero
     range_diff = (high_max - low_min).replace(0, 1e-10)
     ratio = tr_sum / range_diff
-    ratio = ratio.clip(lower=1e-10)  # Prevent log(0)
+    # CRITICAL FIX: clip to 1.0 (not 1e-10) to prevent negative CHOP values
+    # When ratio < 1, log10(ratio) < 0, producing invalid negative CHOP
+    # CHOP should always be 0-100, so ratio must be >= 1.0
+    ratio = ratio.clip(lower=1.0)
 
     chop = 100 * np.log10(ratio) / np.log10(period)
 
@@ -508,6 +511,92 @@ def market_regime(
     result[ranging] = -1
 
     return result
+
+
+def detect_market_regime_direction(
+    df: pd.DataFrame,
+    lookback: int = 20,
+    trend_threshold: float = 0.3,
+    chop_period: int = 14,
+    adx_period: int = 14
+) -> pd.Series:
+    """
+    Classify market regime into BULLISH, BEARISH, or RANGING.
+
+    This is crucial for regime-balanced training to prevent directional bias.
+    If training data is predominantly bearish, the agent learns to short.
+    By balancing across regimes, we ensure the agent learns both directions.
+
+    Args:
+        df: OHLCV DataFrame
+        lookback: Period for trend calculation
+        trend_threshold: Threshold for trend classification (in ATR units)
+        chop_period: Period for choppiness calculation
+        adx_period: Period for ADX calculation
+
+    Returns:
+        Series with values:
+            1: BULLISH (uptrend)
+            0: RANGING (sideways/choppy)
+           -1: BEARISH (downtrend)
+    """
+    # Calculate trend direction using price change over lookback
+    price_change = df['close'].diff(lookback)
+
+    # Calculate ATR for normalization
+    atr_val = atr(df, lookback)
+    atr_val = atr_val.replace(0, 1e-10)  # Avoid division by zero
+
+    # Normalized price change (in ATR units)
+    normalized_change = price_change / (atr_val * lookback)
+
+    # Get regime indicators
+    chop = choppiness_index(df, chop_period)
+    adx_val = adx(df, adx_period)
+
+    # Initialize as ranging
+    result = pd.Series(0, index=df.index, dtype=np.float32)
+
+    # Bullish: price went up significantly AND not too choppy
+    bullish = (normalized_change > trend_threshold) & (chop < 55)
+
+    # Bearish: price went down significantly AND not too choppy
+    bearish = (normalized_change < -trend_threshold) & (chop < 55)
+
+    # If very choppy (CHOP > 60), force to ranging regardless of direction
+    very_choppy = chop > 60
+
+    result[bullish] = 1
+    result[bearish] = -1
+    result[very_choppy] = 0  # Override to ranging if very choppy
+
+    return result
+
+
+def compute_regime_labels(
+    df: pd.DataFrame,
+    lookback: int = 20
+) -> np.ndarray:
+    """
+    Compute regime labels for regime-balanced sampling.
+
+    Args:
+        df: DataFrame with OHLCV data
+        lookback: Period for regime detection
+
+    Returns:
+        Array of regime labels: 0=BULLISH, 1=RANGING, 2=BEARISH
+        (Converted to 0,1,2 for use as class indices in stratified sampling)
+    """
+    regime = detect_market_regime_direction(df, lookback)
+
+    # Convert to 0, 1, 2 for stratified sampling
+    # -1 (bearish) -> 2
+    #  0 (ranging) -> 1
+    #  1 (bullish) -> 0
+    labels = np.where(regime == 1, 0, np.where(regime == 0, 1, 2))
+
+    return labels.astype(np.int32)
 
 
 # =============================================================================
@@ -600,8 +689,8 @@ def engineer_all_features(
 
 def create_smoothed_target(
     df: pd.DataFrame,
-    future_window: int = 12,
-    smooth_window: int = 12,
+    future_window: int = 24,
+    smooth_window: int = 24,
     scale_factor: float = 100.0
 ) -> pd.Series:
     """
@@ -641,7 +730,7 @@ def create_smoothed_target(
 
 def create_return_classes(
     target: pd.Series,
-    class_std_thresholds: Tuple = (-0.25, 0.25)
+    class_std_thresholds: Tuple = (-0.5, 0.5)
 ) -> Tuple[pd.Series, Dict[str, float]]:
     """
     Convert a continuous smoothed-return target into discrete classes.

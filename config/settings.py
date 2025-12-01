@@ -119,11 +119,12 @@ class AnalystConfig:
     cache_clear_interval: int = 50  # Clear cache every N batches
 
     # Target computation
-    future_window: int = 12     # Candles ahead for smoothed return
-    smooth_window: int = 12     # Rolling window for smoothing
+    future_window: int = 24     # Changed from 12: 6-hour lookahead for stronger signal
+    smooth_window: int = 24     # Changed from 12: match future_window for consistency
     num_classes: int = 3        # Simplified: Down/Neutral/Up (was 5)
-    # Wider neutral zone to filter noise - anything between -0.25σ and +0.25σ is Neutral
-    class_std_thresholds: Tuple[float, float] = (-0.25, 0.25)
+    # Wider neutral zone to reduce class imbalance and improve Up recall
+    # Changed from ±0.25σ to ±0.5σ for better class balance
+    class_std_thresholds: Tuple[float, float] = (-0.5, 0.5)
 
 
 @dataclass
@@ -137,14 +138,23 @@ class TradingConfig:
     position_sizes: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
 
     # Reward shaping
-    # NOTE: Penalties are now scaled higher to compete with PnL rewards.
-    # With reward_scaling=0.1, a ±20 pip trade becomes ±2.0 reward,
-    # making penalties (-2.0, -1.0) meaningful for "Sniper" behavior.
-    fomo_penalty: float = -2.0      # Penalty for being flat during momentum
-    chop_penalty: float = -1.0      # Penalty for holding in ranging market
+    # NOTE: Penalties are now small regularizers, not dominant signals.
+    # With reward_scaling=0.1, a 10-pip trade becomes 1.0 reward.
+    # Penalties are now ~2 pip and ~1 pip equivalents to avoid discouraging trading.
+    fomo_penalty: float = -0.2      # Reduced from -2.0 (was 20 pip equivalent, now 2 pip)
+    chop_penalty: float = -0.1      # Reduced from -1.0 (was 10 pip equivalent, now 1 pip)
     fomo_threshold_atr: float = 2.0 # ATR multiplier for FOMO detection
     chop_threshold: float = 60.0    # Choppiness index threshold
     reward_scaling: float = 0.1     # Scale PnL to balance with penalties
+
+    # Risk Management - Stop-Loss and Take-Profit (in pips)
+    # Stop-loss: Automatically close losing positions at this threshold
+    # Based on analysis: avg_loser was -6.87 pips vs avg_winner +5.32 pips
+    # A 15-pip stop allows for normal volatility while cutting catastrophic losses
+    stop_loss_pips: float = 15.0    # Close position if loss exceeds this (in pips)
+    take_profit_pips: float = 25.0  # Close position if profit exceeds this (in pips)
+    use_stop_loss: bool = True      # Enable/disable stop-loss mechanism
+    use_take_profit: bool = True    # Enable/disable take-profit mechanism
 
     # Environment settings
     max_steps_per_episode: int = 2000

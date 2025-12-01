@@ -318,12 +318,19 @@ class RankingMSELoss(nn.Module):
 def compute_class_weights(
     labels: np.ndarray,
     num_classes: int,
-    device: torch.device
+    device: torch.device,
+    up_class_boost: float = 1.5
 ) -> torch.Tensor:
     """
     Compute normalized class weights to counter class imbalance.
-    
+
     Uses inverse frequency weighting normalized to mean=1.
+
+    Args:
+        labels: Training labels
+        num_classes: Number of classes
+        device: Torch device
+        up_class_boost: Extra boost factor for Up class (class 2) to combat Down prediction bias
     """
     counts = np.bincount(labels.astype(int), minlength=num_classes).astype(np.float32)
     total = counts.sum()
@@ -333,7 +340,12 @@ def compute_class_weights(
 
     # Standard inverse frequency weights
     weights = np.where(counts > 0, total / (num_classes * counts), 0.0)
-    
+
+    # CRITICAL FIX: Boost Up class (class 2) weight to combat Down prediction bias
+    # The model tends to over-predict Down, so we boost Up class weight
+    if num_classes >= 3 and up_class_boost > 1.0:
+        weights[2] *= up_class_boost
+
     # Normalize to mean=1
     mean_weight = weights.mean() if weights.mean() > 0 else 1.0
     weights = weights / mean_weight
@@ -946,9 +958,9 @@ def train_analyst(
     """
     # Class names depend on num_classes from config
     class_names_3 = [
-        "Down (< -0.25σ)",
-        "Neutral (-0.25σ to +0.25σ)",
-        "Up (> +0.25σ)"
+        "Down (< -0.5σ)",
+        "Neutral (-0.5σ to +0.5σ)",
+        "Up (> +0.5σ)"
     ]
     class_names_5 = [
         "Strong Down (<-0.5σ)",

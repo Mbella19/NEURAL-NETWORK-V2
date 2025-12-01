@@ -58,8 +58,8 @@ class TradingEnv(gym.Env):
         lookback_1h: int = 24,
         lookback_4h: int = 12,
         spread_pips: float = 1.5,
-        fomo_penalty: float = -2.0,   # Increased from -0.5 for better balance
-        chop_penalty: float = -1.0,   # Increased from -0.3 for better balance
+        fomo_penalty: float = -0.2,   # Further reduced: now ~2 pip equivalent (was -1.0 = 10 pips)
+        chop_penalty: float = -0.1,   # Further reduced: now ~1 pip equivalent per bar (was -0.5 = 5 pips)
         fomo_threshold_atr: float = 2.0,
         chop_threshold: float = 60.0,
         max_steps: int = 2000,
@@ -67,7 +67,15 @@ class TradingEnv(gym.Env):
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
-        pre_windowed: bool = True  # FIXED: If True, data is already windowed (start_idx=0)
+        pre_windowed: bool = True,  # FIXED: If True, data is already windowed (start_idx=0)
+        # Risk Management
+        stop_loss_pips: float = 15.0,   # Auto-close if loss exceeds this (in pips)
+        take_profit_pips: float = 25.0, # Auto-close if profit exceeds this (in pips)
+        use_stop_loss: bool = True,     # Enable/disable stop-loss
+        use_take_profit: bool = True,   # Enable/disable take-profit
+        # Regime-balanced sampling
+        regime_labels: Optional[np.ndarray] = None,  # 0=Bullish, 1=Ranging, 2=Bearish
+        use_regime_sampling: bool = True  # Sample episodes balanced across regimes
     ):
         """
         Initialize the trading environment.
@@ -120,7 +128,13 @@ class TradingEnv(gym.Env):
         self.max_steps = max_steps
         self.reward_scaling = reward_scaling  # Scale PnL to balance with penalties
 
-        # Calculate valid range
+        # Risk Management - Stop-Loss and Take-Profit
+        self.stop_loss_pips = stop_loss_pips
+        self.take_profit_pips = take_profit_pips
+        self.use_stop_loss = use_stop_loss
+        self.use_take_profit = use_take_profit
+
+        # Calculate valid range FIRST (needed for regime indices)
         # FIXED: If pre_windowed=True, data is already trimmed by prepare_env_data
         # so start_idx should be 0 (no double offset)
         if pre_windowed:
@@ -131,6 +145,29 @@ class TradingEnv(gym.Env):
         
         self.end_idx = len(close_prices) - 1
         self.n_samples = self.end_idx - self.start_idx
+        
+        # Regime-balanced sampling (AFTER start_idx/end_idx are set)
+        self.use_regime_sampling = use_regime_sampling and regime_labels is not None
+        if regime_labels is not None:
+            self.regime_labels = regime_labels.astype(np.int32)
+            # Pre-compute indices for each regime (0=Bullish, 1=Ranging, 2=Bearish)
+            self.regime_indices = {
+                0: np.where(self.regime_labels == 0)[0],  # Bullish
+                1: np.where(self.regime_labels == 1)[0],  # Ranging
+                2: np.where(self.regime_labels == 2)[0],  # Bearish
+            }
+            # Filter to valid range for episode starts
+            max_start = max(self.start_idx + 1, self.end_idx - max_steps)
+            for regime in self.regime_indices:
+                valid = self.regime_indices[regime]
+                valid = valid[(valid >= self.start_idx) & (valid < max_start)]
+                self.regime_indices[regime] = valid
+            # Log regime distribution
+            print(f"Regime sampling enabled: Bullish={len(self.regime_indices[0])}, "
+                  f"Ranging={len(self.regime_indices[1])}, Bearish={len(self.regime_indices[2])}")
+        else:
+            self.regime_labels = None
+            self.regime_indices = None
 
         # Action space: Multi-Discrete([direction, size])
         # Direction: 0=Flat, 1=Long, 2=Short
@@ -271,8 +308,12 @@ class TradingEnv(gym.Env):
         atr = self.market_features[self.current_idx, 0] if len(self.market_features.shape) > 1 else 1.0
 
         # Normalize entry price and unrealized PnL
-        if self.position != 0 and atr > 0:
-            entry_price_norm = (self.entry_price - current_price) / (atr * 100)
+        # CRITICAL FIX: Use floor for ATR to prevent division by near-zero
+        atr_safe = max(atr, 1e-6)
+        if self.position != 0:
+            entry_price_norm = (self.entry_price - current_price) / (atr_safe * 100)
+            # Clip to prevent extreme values
+            entry_price_norm = np.clip(entry_price_norm, -10.0, 10.0)
             unrealized_pnl = self._calculate_unrealized_pnl()
             unrealized_pnl_norm = unrealized_pnl / 100  # Normalize by 100 pips
         else:
@@ -316,6 +357,89 @@ class TradingEnv(gym.Env):
             pnl_pips = (self.entry_price - current_price) / pip_value
 
         return pnl_pips * self.position_size
+
+    def _check_stop_loss_take_profit(self) -> Tuple[float, dict]:
+        """
+        Check and execute stop-loss or take-profit if triggered.
+
+        This method is called BEFORE the agent's action to enforce risk management.
+        Stop-loss cuts losing positions early to prevent catastrophic losses.
+        Take-profit locks in gains to improve risk/reward ratio.
+
+        Returns:
+            Tuple of (reward, info_dict) if triggered, (0.0, {}) otherwise
+        """
+        reward = 0.0
+        info = {
+            'stop_loss_triggered': False,
+            'take_profit_triggered': False,
+            'trade_closed': False,
+            'pnl': 0.0
+        }
+
+        # No position = nothing to check
+        if self.position == 0:
+            return reward, info
+
+        # Get current unrealized PnL (sized pips)
+        unrealized_pnl = self._calculate_unrealized_pnl()
+
+        # Raw pips (before position size adjustment) for threshold comparison
+        current_price = self.close_prices[self.current_idx]
+        pip_value = 0.0001
+        if self.position == 1:  # Long
+            raw_pips = (current_price - self.entry_price) / pip_value
+        else:  # Short
+            raw_pips = (self.entry_price - current_price) / pip_value
+
+        triggered = False
+        trigger_reason = None
+
+        # Check stop-loss (loss exceeds threshold)
+        if self.use_stop_loss and raw_pips < -self.stop_loss_pips:
+            triggered = True
+            trigger_reason = 'stop_loss'
+            info['stop_loss_triggered'] = True
+
+        # Check take-profit (profit exceeds threshold)
+        elif self.use_take_profit and raw_pips > self.take_profit_pips:
+            triggered = True
+            trigger_reason = 'take_profit'
+            info['take_profit_triggered'] = True
+
+        if triggered:
+            # Calculate final PnL delta for reward
+            final_delta = unrealized_pnl - self.prev_unrealized_pnl
+            reward += final_delta * self.reward_scaling
+
+            # Add direction bonus for take-profit (profitable exit)
+            if trigger_reason == 'take_profit' and unrealized_pnl > 0:
+                reward += 5.0 * self.position_size * self.reward_scaling
+                info['direction_bonus'] = True
+
+            # Record the trade
+            info['trade_closed'] = True
+            info['pnl'] = unrealized_pnl
+            info['pnl_delta'] = final_delta
+            info['close_reason'] = trigger_reason
+
+            self.total_pnl += unrealized_pnl
+            self.trades.append({
+                'entry': self.entry_price,
+                'exit': current_price,
+                'direction': self.position,
+                'size': self.position_size,
+                'pnl': unrealized_pnl,
+                'close_reason': trigger_reason
+            })
+
+            # Reset position state
+            self.position = 0
+            self.position_size = 0.0
+            self.entry_price = 0.0
+            self.prev_unrealized_pnl = 0.0
+
+        return reward, info
 
     def _execute_action(self, action: np.ndarray) -> Tuple[float, dict]:
         """
@@ -361,7 +485,13 @@ class TradingEnv(gym.Env):
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 reward += final_delta * self.reward_scaling  # Capture final leg!
-                
+
+                # Direction bonus: reward correct direction predictions
+                # FIXED: Scale by position_size and reward_scaling to match PnL scaling
+                if final_unrealized > 0:
+                    reward += 5.0 * self.position_size * self.reward_scaling  # ~5 pip bonus scaled
+                    info['direction_bonus'] = True
+
                 # Record trade statistics
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized  # Unscaled for tracking
@@ -374,7 +504,7 @@ class TradingEnv(gym.Env):
                     'size': self.position_size,
                     'pnl': final_unrealized
                 })
-                
+
                 # NOW reset position state
                 self.position = 0
                 self.position_size = 0.0
@@ -387,7 +517,13 @@ class TradingEnv(gym.Env):
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 reward += final_delta * self.reward_scaling  # Capture final leg!
-                
+
+                # Direction bonus: reward correct direction predictions
+                # FIXED: Scale by position_size and reward_scaling to match PnL scaling
+                if final_unrealized > 0:
+                    reward += 5.0 * self.position_size * self.reward_scaling  # ~5 pip bonus scaled
+                    info['direction_bonus'] = True
+
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized
                 info['pnl_delta'] = final_delta
@@ -399,7 +535,7 @@ class TradingEnv(gym.Env):
                     'size': self.position_size,
                     'pnl': final_unrealized
                 })
-                
+
                 # NOW reset position state before opening new one
                 self.position = 0
                 self.position_size = 0.0
@@ -411,6 +547,8 @@ class TradingEnv(gym.Env):
                 self.position_size = new_size
                 self.entry_price = current_price
                 reward -= self.spread_pips * new_size * self.reward_scaling  # Spread cost
+                # CRITICAL FIX: Include spread in total_pnl to match backtest accounting
+                self.total_pnl -= self.spread_pips * new_size
                 info['trade_opened'] = True
 
         elif direction == 2:  # Short
@@ -419,7 +557,13 @@ class TradingEnv(gym.Env):
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 reward += final_delta * self.reward_scaling  # Capture final leg!
-                
+
+                # Direction bonus: reward correct direction predictions
+                # Scaled by position_size * reward_scaling for consistency with backtest
+                if final_unrealized > 0:
+                    reward += 5.0 * self.position_size * self.reward_scaling  # ~5 pip bonus scaled
+                    info['direction_bonus'] = True
+
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized
                 info['pnl_delta'] = final_delta
@@ -431,7 +575,7 @@ class TradingEnv(gym.Env):
                     'size': self.position_size,
                     'pnl': final_unrealized
                 })
-                
+
                 # NOW reset position state before opening new one
                 self.position = 0
                 self.position_size = 0.0
@@ -443,6 +587,8 @@ class TradingEnv(gym.Env):
                 self.position_size = new_size
                 self.entry_price = current_price
                 reward -= self.spread_pips * new_size * self.reward_scaling  # Spread cost
+                # CRITICAL FIX: Include spread in total_pnl to match backtest accounting
+                self.total_pnl -= self.spread_pips * new_size
                 info['trade_opened'] = True
 
         # Continuous PnL feedback: reward based on CHANGE in unrealized PnL each step.
@@ -485,6 +631,20 @@ class TradingEnv(gym.Env):
         # Random starting point
         if options and 'start_idx' in options:
             self.current_idx = options['start_idx']
+        elif self.use_regime_sampling and self.regime_indices is not None:
+            # REGIME-BALANCED SAMPLING: Equal probability for each regime
+            # This prevents directional bias from unbalanced training data
+            available_regimes = [r for r in [0, 1, 2] if len(self.regime_indices[r]) > 0]
+            if len(available_regimes) > 0:
+                # Randomly pick a regime
+                chosen_regime = self.np_random.choice(available_regimes)
+                # Randomly pick a starting index from that regime
+                regime_idx = self.np_random.integers(0, len(self.regime_indices[chosen_regime]))
+                self.current_idx = self.regime_indices[chosen_regime][regime_idx]
+            else:
+                # Fallback to random if no regime indices available
+                max_start = max(self.start_idx + 1, self.end_idx - self.max_steps)
+                self.current_idx = self.np_random.integers(self.start_idx, max_start)
         else:
             # FIXED: Ensure valid range for random start
             max_start = max(self.start_idx + 1, self.end_idx - self.max_steps)
@@ -514,8 +674,16 @@ class TradingEnv(gym.Env):
         Returns:
             observation, reward, terminated, truncated, info
         """
-        # Execute action
-        reward, info = self._execute_action(action)
+        # FIRST: Check stop-loss/take-profit BEFORE agent action
+        # This enforces risk management regardless of what the agent wants to do
+        sl_tp_reward, sl_tp_info = self._check_stop_loss_take_profit()
+
+        # THEN: Execute agent's action (which may open new positions or do nothing)
+        action_reward, action_info = self._execute_action(action)
+
+        # Combine rewards and info
+        reward = sl_tp_reward + action_reward
+        info = {**action_info, **sl_tp_info}  # SL/TP info takes precedence
 
         # Move to next step
         self.current_idx += 1
@@ -533,6 +701,9 @@ class TradingEnv(gym.Env):
         info['position'] = self.position
         info['total_pnl'] = self.total_pnl
         info['n_trades'] = len(self.trades)
+        # Pass trades list for win rate calculation (only on episode end to save memory)
+        if terminated or truncated:
+            info['trades'] = self.trades.copy()
 
         return obs, reward, terminated, truncated, info
 

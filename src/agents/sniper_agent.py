@@ -305,6 +305,8 @@ class SniperAgent:
         episode_rewards = []
         episode_lengths = []
         episode_pnls = []
+        episode_trades = []
+        episode_win_rates = []
 
         for ep in range(n_episodes):
             obs, info = env.reset()
@@ -324,11 +326,23 @@ class SniperAgent:
             if 'total_pnl' in info:
                 episode_pnls.append(info['total_pnl'])
 
+            # CRITICAL FIX: Track trade count and win rate
+            n_trades = info.get('n_trades', 0)
+            episode_trades.append(n_trades)
+
+            win_rate = 0.0
+            if n_trades > 0 and 'trades' in info:
+                wins = sum(1 for t in info['trades'] if t.get('pnl', 0) > 0)
+                win_rate = wins / n_trades
+            episode_win_rates.append(win_rate)
+
         return {
             'mean_reward': np.mean(episode_rewards),
             'std_reward': np.std(episode_rewards),
             'mean_length': np.mean(episode_lengths),
             'mean_pnl': np.mean(episode_pnls) if episode_pnls else 0.0,
+            'mean_trades': np.mean(episode_trades) if episode_trades else 0.0,
+            'win_rate': np.mean(episode_win_rates) if episode_win_rates else 0.0,
             'n_episodes': n_episodes
         }
 

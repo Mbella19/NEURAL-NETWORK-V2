@@ -31,6 +31,7 @@ from ..environments.trading_env import TradingEnv
 from ..agents.sniper_agent import SniperAgent, create_agent
 from ..utils.logging_config import setup_logging, get_logger
 from ..utils.metrics import calculate_trading_metrics, TradingMetrics
+from ..data.features import compute_regime_labels
 
 logger = get_logger(__name__)
 
@@ -125,8 +126,15 @@ class AgentTrainingLogger(BaseCallback):
             if len(infos) > 0 and infos[0]:
                 info = infos[0]
                 self.episode_pnls.append(info.get('total_pnl', 0.0))
-                self.episode_trades.append(info.get('total_trades', 0))
-                self.episode_win_rates.append(info.get('win_rate', 0.0))
+                # CRITICAL FIX: Use 'n_trades' (what env actually sets) instead of 'total_trades'
+                self.episode_trades.append(info.get('n_trades', 0))
+                # Calculate win rate from trades if available
+                n_trades = info.get('n_trades', 0)
+                win_rate = 0.0
+                if n_trades > 0 and 'trades' in info:
+                    wins = sum(1 for t in info['trades'] if t.get('pnl', 0) > 0)
+                    win_rate = wins / n_trades
+                self.episode_win_rates.append(win_rate)
 
             # Log episode summary
             n_episodes = len(self.episode_rewards)
@@ -419,7 +427,9 @@ def create_trading_env(
     config: Optional[object] = None,
     device: Optional[torch.device] = None,
     market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training
-    market_feat_std: Optional[np.ndarray] = None    # Pre-computed from training
+    market_feat_std: Optional[np.ndarray] = None,   # Pre-computed from training
+    regime_labels: Optional[np.ndarray] = None,     # Regime labels for balanced sampling
+    use_regime_sampling: bool = True                # Enable regime-balanced episode starts
 ) -> TradingEnv:
     """
     Create the trading environment.
@@ -437,13 +447,19 @@ def create_trading_env(
     """
     # Default configuration
     spread_pips = 1.5
-    fomo_penalty = -2.0     # Increased for better balance
-    chop_penalty = -1.0     # Increased for better balance
+    fomo_penalty = -0.2     # Reduced: ~2 pip equivalent (was -2.0)
+    chop_penalty = -0.1     # Reduced: ~1 pip equivalent (was -1.0)
     fomo_threshold_atr = 2.0
     chop_threshold = 60.0
     max_steps = 2000
     reward_scaling = 0.1    # Scale PnL to balance with penalties
     context_dim = 64
+    
+    # Risk Management defaults
+    stop_loss_pips = 15.0
+    take_profit_pips = 25.0
+    use_stop_loss = True
+    use_take_profit = True
 
     if config is not None:
         spread_pips = getattr(config, 'spread_pips', spread_pips)
@@ -453,6 +469,11 @@ def create_trading_env(
         chop_threshold = getattr(config, 'chop_threshold', chop_threshold)
         max_steps = getattr(config, 'max_steps_per_episode', max_steps)
         reward_scaling = getattr(config, 'reward_scaling', reward_scaling)
+        # Risk Management
+        stop_loss_pips = getattr(config, 'stop_loss_pips', stop_loss_pips)
+        take_profit_pips = getattr(config, 'take_profit_pips', take_profit_pips)
+        use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
+        use_take_profit = getattr(config, 'use_take_profit', use_take_profit)
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
@@ -474,7 +495,15 @@ def create_trading_env(
         reward_scaling=reward_scaling,
         device=device,
         market_feat_mean=market_feat_mean,
-        market_feat_std=market_feat_std
+        market_feat_std=market_feat_std,
+        # Risk Management
+        stop_loss_pips=stop_loss_pips,
+        take_profit_pips=take_profit_pips,
+        use_stop_loss=use_stop_loss,
+        use_take_profit=use_take_profit,
+        # Regime-balanced sampling
+        regime_labels=regime_labels,
+        use_regime_sampling=use_regime_sampling
     )
 
     return env
@@ -581,6 +610,17 @@ def train_agent(
     logger.info(f"  Mean: {market_feat_mean}")
     logger.info(f"  Std:  {market_feat_std}")
 
+    # Compute regime labels for balanced sampling (training data only)
+    # This ensures agent learns from BULLISH, BEARISH, and RANGING markets equally
+    logger.info("Computing regime labels for balanced sampling...")
+    train_regime_labels = compute_regime_labels(df_15m.iloc[:split_idx], lookback=20)
+    regime_counts = {
+        'Bullish': (train_regime_labels == 0).sum(),
+        'Ranging': (train_regime_labels == 1).sum(),
+        'Bearish': (train_regime_labels == 2).sum()
+    }
+    logger.info(f"Regime distribution: {regime_counts}")
+
     # Create environments
     logger.info("Creating training environment...")
     train_env = create_trading_env(
@@ -589,7 +629,9 @@ def train_agent(
         config=config,
         device=device,
         market_feat_mean=market_feat_mean,
-        market_feat_std=market_feat_std
+        market_feat_std=market_feat_std,
+        regime_labels=train_regime_labels,  # Enable regime-balanced sampling
+        use_regime_sampling=True
     )
 
     logger.info("Creating evaluation environment...")
@@ -599,7 +641,9 @@ def train_agent(
         config=config,
         device=device,
         market_feat_mean=market_feat_mean,  # Use TRAINING stats for eval too
-        market_feat_std=market_feat_std
+        market_feat_std=market_feat_std,
+        regime_labels=None,  # Eval uses random sampling (no regime bias)
+        use_regime_sampling=False
     )
 
     # Log environment info
