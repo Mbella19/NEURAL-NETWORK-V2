@@ -706,7 +706,7 @@ def train_agent(
 
     # Create agent
     logger.info("Creating PPO agent...")
-    agent = create_agent(train_env, config)
+    agent = create_agent(train_env, config.agent)
 
     # Create training logger callback
     training_callback = AgentTrainingLogger(
