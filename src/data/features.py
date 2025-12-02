@@ -516,7 +516,7 @@ def market_regime(
 def detect_market_regime_direction(
     df: pd.DataFrame,
     lookback: int = 20,
-    trend_threshold: float = 0.3,
+    trend_threshold: float = 0.10,
     chop_period: int = 14,
     adx_period: int = 14
 ) -> pd.Series:

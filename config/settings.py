@@ -83,7 +83,7 @@ class DataConfig:
 
     # Lookback windows (number of candles)
     lookback_windows: Dict[str, int] = field(default_factory=lambda: {
-        '15m': 48,   # 12 hours of 15m candles
+        '15m': 20,   # 5 hours (was 48/12h)
         '1h': 24,    # 24 hours of 1H candles
         '4h': 12     # 48 hours of 4H candles
     })
@@ -114,8 +114,8 @@ class AnalystConfig:
     patience: int = 15          
 
     cache_clear_interval: int = 50
-    future_window: int = 48     # 12 Hours (Smoother Target)
-    smooth_window: int = 48     
+    future_window: int = 16     # 4 Hours (Capture the Session trend)
+    smooth_window: int = 12     # 3 Hours (Smooth enough to remove noise, sharp enough to keep signal)
     num_classes: int = 3        
     class_std_thresholds: Tuple[float, float] = (-0.15, 0.15)   # Narrowed to force trend detection
 
