@@ -59,6 +59,7 @@ class TradingEnv(gym.Env):
         lookback_1h: int = 24,
         lookback_4h: int = 12,
         spread_pips: float = 1.5,
+        slippage_pips: float = 1.0,   # Realistic slippage: 0.5-2 pips per trade (not modeled before!)
         fomo_penalty: float = -0.2,   # Further reduced: now ~2 pip equivalent (was -1.0 = 10 pips)
         chop_penalty: float = -0.1,   # Further reduced: now ~1 pip equivalent per bar (was -0.5 = 5 pips)
         fomo_threshold_atr: float = 2.0,
@@ -79,7 +80,12 @@ class TradingEnv(gym.Env):
         use_regime_sampling: bool = True,  # Sample episodes balanced across regimes
         # Volatility Sizing
         volatility_sizing: bool = True,  # Scale position size inversely to ATR
-        risk_pips_target: float = 15.0   # Reference risk for normalization (e.g. 15 pips)
+        risk_pips_target: float = 15.0,   # Reference risk for normalization (e.g. 15 pips)
+        # Classification mode
+        # Classification mode
+        num_classes: int = 2,  # Binary (2) vs multi-class (3) - affects observation size
+        # Analyst Alignment
+        enforce_analyst_alignment: bool = False  # If True, restrict actions to analyst direction
     ):
         """
         Initialize the trading environment.
@@ -125,6 +131,7 @@ class TradingEnv(gym.Env):
 
         # Trading parameters
         self.spread_pips = spread_pips
+        self.slippage_pips = slippage_pips  # Realistic execution slippage
         self.fomo_penalty = fomo_penalty
         self.chop_penalty = chop_penalty
         self.fomo_threshold_atr = fomo_threshold_atr
@@ -141,7 +148,13 @@ class TradingEnv(gym.Env):
         
         # Volatility Sizing
         self.volatility_sizing = volatility_sizing
+        # Volatility Sizing
+        self.volatility_sizing = volatility_sizing
         self.risk_pips_target = risk_pips_target
+        
+        # Analyst Alignment
+        self.enforce_analyst_alignment = enforce_analyst_alignment
+        self.current_probs = None  # Store for action masking
 
         # Calculate valid range FIRST (needed for regime indices)
         # FIXED: If pre_windowed=True, data is already trimmed by prepare_env_data
@@ -183,11 +196,16 @@ class TradingEnv(gym.Env):
         # Size: 0=0.25, 1=0.5, 2=0.75, 3=1.0
         self.action_space = spaces.MultiDiscrete([3, 4])
 
+        # Store num_classes for observation construction
+        self.num_classes = num_classes
+
         # Observation space
-        # Context vector + position state (3) + market features (5)
-        # + Analyst Probs (3) + Edge (1) + Confidence (1) + Uncertainty (1) = +6
+        # Context vector + position state (3) + market features (5) + analyst_metrics
+        # Binary (2 classes): [p_down, p_up, edge, confidence, uncertainty] = 5
+        # Multi-class (3 classes): [p_down, p_neutral, p_up, edge, confidence, uncertainty] = 6
         n_market_features = market_features.shape[1] if len(market_features.shape) > 1 else 5
-        obs_dim = context_dim + 3 + n_market_features + 6
+        analyst_metrics_dim = 5 if num_classes == 2 else 6
+        obs_dim = context_dim + 3 + n_market_features + analyst_metrics_dim
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -324,39 +342,55 @@ class TradingEnv(gym.Env):
                     return context.cpu().numpy().flatten(), probs.cpu().numpy().flatten()
                 else:
                     context = self.analyst.get_context(x_15m, x_1h, x_4h)
-                    # Dummy probs
-                    probs = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    # Dummy probs - match num_classes
+                    if self.num_classes == 2:
+                        probs = np.array([0.5, 0.5], dtype=np.float32)  # Binary: neutral
+                    else:
+                        probs = np.array([0.0, 1.0, 0.0], dtype=np.float32)  # Multi: neutral
                     return context.cpu().numpy().flatten(), probs
 
-        # No analyst - return zeros
+        # No analyst - return zeros with correct probs size
+        if self.num_classes == 2:
+            dummy_probs = np.array([0.5, 0.5], dtype=np.float32)  # Binary: neutral
+        else:
+            dummy_probs = np.array([0.0, 1.0, 0.0], dtype=np.float32)  # Multi: neutral
         return (
             np.zeros(self.context_dim, dtype=np.float32),
-            np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            dummy_probs
         )
 
     def _get_observation(self) -> np.ndarray:
         """Construct observation vector."""
         # Context vector and probabilities
+        # Context vector and probabilities
         context, probs = self._get_analyst_data(self.current_idx)
+        self.current_probs = probs  # Store for action enforcement
 
-        # Calculate Analyst Metrics
-        # probs = [p_down, p_neutral, p_up]
-        p_down = probs[0]
-        p_neutral = probs[1]
-        p_up = probs[2]
-        
-        edge = p_up - p_down
-        confidence = np.max(probs)
-        
-        # Entropy (Uncertainty)
-        # Clip to avoid log(0)
+        # Calculate Analyst Metrics - handle both binary (2) and multi-class (3) probs
+        # Binary: probs = [p_down, p_up]
+        # Multi-class: probs = [p_down, p_neutral, p_up]
         probs_safe = np.clip(probs, 1e-6, 1.0)
-        uncertainty = -np.sum(probs_safe * np.log(probs_safe))
-        
-        analyst_metrics = np.array([
-            p_down, p_neutral, p_up,
-            edge, confidence, uncertainty
-        ], dtype=np.float32)
+        uncertainty = -np.sum(probs_safe * np.log(probs_safe))  # Entropy
+
+        if len(probs) == 2 or self.num_classes == 2:
+            # Binary classification: [p_down, p_up]
+            p_down = probs[0]
+            p_up = probs[1] if len(probs) > 1 else 1 - p_down
+            edge = p_up - p_down
+            confidence = max(p_down, p_up)
+            analyst_metrics = np.array([
+                p_down, p_up, edge, confidence, uncertainty
+            ], dtype=np.float32)
+        else:
+            # Multi-class: [p_down, p_neutral, p_up]
+            p_down = probs[0]
+            p_neutral = probs[1]
+            p_up = probs[2]
+            edge = p_up - p_down
+            confidence = np.max(probs)
+            analyst_metrics = np.array([
+                p_down, p_neutral, p_up, edge, confidence, uncertainty
+            ], dtype=np.float32)
 
         # Position state
         current_price = self.close_prices[self.current_idx]
@@ -518,6 +552,54 @@ class TradingEnv(gym.Env):
         """
         direction = action[0]  # 0=Flat, 1=Long, 2=Short
         size_idx = action[1]   # 0-3
+        
+        # Enforce Analyst Alignment (Action Masking)
+        if self.enforce_analyst_alignment and self.current_probs is not None:
+            # Determine Analyst Direction
+            # Binary: [p_down, p_up] -> 0=Down, 1=Up
+            # Multi: [p_down, p_neutral, p_up] -> 0=Down, 1=Neutral, 2=Up
+            
+            analyst_dir = 0 # Default Flat
+            
+            if len(self.current_probs) == 2:
+                # Binary: 0=Short, 1=Long (mapped to env: 2=Short, 1=Long)
+                p_down, p_up = self.current_probs
+                if p_up > 0.5:
+                    analyst_dir = 1 # Long
+                elif p_down > 0.5:
+                    analyst_dir = 2 # Short
+                # Else neutral/uncertain
+                
+            elif len(self.current_probs) == 3:
+                # Multi: 0=Down, 1=Neutral, 2=Up
+                p_down, p_neutral, p_up = self.current_probs
+                max_idx = np.argmax(self.current_probs)
+                if max_idx == 2: # Up
+                    analyst_dir = 1 # Long
+                elif max_idx == 0: # Down
+                    analyst_dir = 2 # Short
+                else:
+                    analyst_dir = 0 # Flat
+            
+            # Check for violation
+            # If Analyst is Long (1), Agent cannot be Short (2)
+            # If Analyst is Short (2), Agent cannot be Long (1)
+            # If Analyst is Flat (0), Agent must be Flat (0)
+            
+            violation = False
+            if analyst_dir == 1 and direction == 2: # Analyst Long, Agent Short
+                violation = True
+            elif analyst_dir == 2 and direction == 1: # Analyst Short, Agent Long
+                violation = True
+            elif analyst_dir == 0 and direction != 0: # Analyst Flat, Agent Active
+                violation = True
+                
+            if violation:
+                # Force Flat Action
+                direction = 0
+                # Optional: Add small penalty? No, just prevent the action.
+                # The agent will learn that this action does nothing.
+        
         base_size = self.POSITION_SIZES[size_idx]
         
         # Volatility Sizing: Adjust position size so that risk is constant
@@ -637,9 +719,11 @@ class TradingEnv(gym.Env):
                 self.position = 1
                 self.position_size = new_size
                 self.entry_price = current_price
-                reward -= self.spread_pips * new_size * self.reward_scaling  # Spread cost
-                # CRITICAL FIX: Include spread in total_pnl to match backtest accounting
-                self.total_pnl -= self.spread_pips * new_size
+                # Total execution cost = spread + slippage (realistic modeling)
+                exec_cost = (self.spread_pips + self.slippage_pips) * new_size
+                reward -= exec_cost * self.reward_scaling
+                # Include execution cost in total_pnl to match backtest accounting
+                self.total_pnl -= exec_cost
                 info['trade_opened'] = True
 
         elif direction == 2:  # Short
@@ -677,9 +761,11 @@ class TradingEnv(gym.Env):
                 self.position = -1
                 self.position_size = new_size
                 self.entry_price = current_price
-                reward -= self.spread_pips * new_size * self.reward_scaling  # Spread cost
-                # CRITICAL FIX: Include spread in total_pnl to match backtest accounting
-                self.total_pnl -= self.spread_pips * new_size
+                # Total execution cost = spread + slippage (realistic modeling)
+                exec_cost = (self.spread_pips + self.slippage_pips) * new_size
+                reward -= exec_cost * self.reward_scaling
+                # Include execution cost in total_pnl to match backtest accounting
+                self.total_pnl -= exec_cost
                 info['trade_opened'] = True
 
         # Continuous PnL feedback: reward based on CHANGE in unrealized PnL each step.

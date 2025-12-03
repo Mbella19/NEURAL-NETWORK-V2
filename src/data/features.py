@@ -833,6 +833,251 @@ def create_return_classes(
     return labels, meta
 
 
+def create_binary_direction_target(
+    df: pd.DataFrame,
+    future_window: int = 16,
+    smooth_window: int = 12,
+    min_move_atr: float = 0.3,
+    atr_period: int = 14
+) -> Tuple[pd.Series, pd.Series, Dict[str, float]]:
+    """
+    Create binary Up/Down labels, excluding weak/neutral moves.
+
+    This addresses the directional confusion problem where the model achieves
+    71% recall on Neutral but only ~50% on Up/Down. By excluding weak moves,
+    we train only on clear directional signals.
+
+    Args:
+        df: DataFrame with 'close' column (and optionally 'atr')
+        future_window: How many candles ahead (16 = 4 hours on 15m)
+        smooth_window: Rolling window for smoothing
+        min_move_atr: Minimum move in ATR units to count as directional
+        atr_period: ATR calculation period if 'atr' not in df
+
+    Returns:
+        Tuple of:
+            - labels: 0=Down, 1=Up (NaN for excluded neutral moves)
+            - valid_mask: Boolean mask for training samples
+            - meta: Metadata dict with thresholds and stats
+    """
+    # Calculate smoothed future return
+    future_smoothed = df['close'].shift(-future_window).rolling(
+        smooth_window, min_periods=1
+    ).mean()
+    future_return = (future_smoothed / df['close']) - 1
+
+    # Get or calculate ATR
+    if 'atr' in df.columns:
+        atr = df['atr']
+    else:
+        # Calculate ATR from price
+        high_low = df['high'] - df['low'] if 'high' in df.columns else df['close'].diff().abs()
+        atr = high_low.rolling(atr_period, min_periods=1).mean()
+
+    # Normalize ATR to percentage terms (like future_return)
+    atr_pct = atr / df['close']
+
+    # Threshold: at least min_move_atr * ATR move
+    threshold = min_move_atr * atr_pct
+
+    # Create labels: 0=Down, 1=Up, NaN=Excluded (neutral/weak)
+    labels = pd.Series(index=df.index, dtype=np.float32)
+    labels[:] = np.nan  # Start all as NaN (excluded)
+
+    down_mask = future_return < -threshold
+    up_mask = future_return > threshold
+
+    labels[down_mask] = 0  # Down
+    labels[up_mask] = 1    # Up
+    # Neutral moves (between -threshold and +threshold) remain NaN
+
+    # Valid mask for filtering dataset
+    valid_mask = ~labels.isna()
+
+    # Metadata
+    n_down = down_mask.sum()
+    n_up = up_mask.sum()
+    n_neutral = len(df) - n_down - n_up
+    n_valid = valid_mask.sum()
+
+    meta = {
+        'num_classes': 2,
+        'min_move_atr': min_move_atr,
+        'future_window': future_window,
+        'smooth_window': smooth_window,
+        'n_down': int(n_down),
+        'n_up': int(n_up),
+        'n_neutral_excluded': int(n_neutral),
+        'n_valid': int(n_valid),
+        'pct_excluded': float(n_neutral / len(df) * 100),
+        'class_balance': float(n_up / (n_down + n_up)) if (n_down + n_up) > 0 else 0.5
+    }
+
+    logger.info(
+        f"Binary direction target: {n_down} Down, {n_up} Up, "
+        f"{n_neutral} excluded ({meta['pct_excluded']:.1f}%)"
+    )
+
+    return labels, valid_mask, meta
+
+
+def create_auxiliary_targets(
+    df: pd.DataFrame,
+    future_window: int = 16,
+    atr_period: int = 14,
+    adx_threshold: float = 25.0
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Create auxiliary targets for multi-task learning:
+    1. Volatility target: Future ATR / Current ATR (regression)
+    2. Regime target: Trending (1) vs Ranging (0) based on ADX
+
+    These auxiliary losses provide regularization and help the model
+    learn better representations.
+
+    Args:
+        df: DataFrame with OHLC data
+        future_window: How many candles ahead
+        atr_period: ATR calculation period
+        adx_threshold: ADX value above which market is "trending"
+
+    Returns:
+        Tuple of (volatility_target, regime_target)
+    """
+    # Calculate ATR
+    if 'atr' in df.columns:
+        atr = df['atr']
+    else:
+        high_low = df['high'] - df['low'] if 'high' in df.columns else df['close'].diff().abs()
+        atr = high_low.rolling(atr_period, min_periods=1).mean()
+
+    # Volatility target: Future ATR / Current ATR
+    future_atr = atr.shift(-future_window)
+    volatility_target = (future_atr / atr).fillna(1.0).astype(np.float32)
+    # Clip extreme values
+    volatility_target = volatility_target.clip(0.5, 2.0)
+
+    # Regime target: 1 if ADX > threshold (trending), else 0
+    if 'adx' in df.columns:
+        regime_target = (df['adx'] > adx_threshold).astype(np.float32)
+    else:
+        # Simple proxy: use ATR percentile
+        atr_rolling_pct = atr.rolling(100, min_periods=20).apply(
+            lambda x: (x[-1] > np.percentile(x, 60)).astype(float),
+            raw=True
+        )
+        regime_target = atr_rolling_pct.fillna(0.0).astype(np.float32)
+
+    return volatility_target, regime_target
+
+
+def create_multi_horizon_targets(
+    df: pd.DataFrame,
+    horizons: Dict[str, int] = None,
+    smooth_window: int = 4,
+    min_move_atr: float = 0.3,
+    atr_period: int = 14
+) -> Tuple[Dict[str, pd.Series], Dict[str, pd.Series], Dict[str, Dict]]:
+    """
+    Create binary direction targets at MULTIPLE time horizons.
+
+    This addresses the Target Mismatch problem by training on multiple horizons:
+    - Short horizons (1H) are easier to predict and provide "stepping stones"
+    - The model learns features useful across multiple time scales
+    - Acts as implicit regularization against overfitting to noisy 4H target
+
+    Args:
+        df: DataFrame with 'close' column (and optionally 'atr')
+        horizons: Dict mapping horizon name to future_window (e.g., {'1h': 4, '2h': 8, '4h': 16})
+                  All windows are in 15-minute candles
+        smooth_window: Rolling window for smoothing (shared across horizons)
+        min_move_atr: Minimum move in ATR units to count as directional
+        atr_period: ATR calculation period if 'atr' not in df
+
+    Returns:
+        Tuple of:
+            - labels_dict: Dict[horizon_name, labels_series] (0=Down, 1=Up, NaN=excluded)
+            - valid_masks_dict: Dict[horizon_name, valid_mask_series]
+            - meta_dict: Dict[horizon_name, metadata_dict]
+    """
+    if horizons is None:
+        # Default: 1H, 2H, 4H horizons (in 15-minute candles)
+        horizons = {
+            '1h': 4,    # 4 × 15min = 1 hour
+            '2h': 8,    # 8 × 15min = 2 hours
+            '4h': 16    # 16 × 15min = 4 hours (primary target)
+        }
+
+    # Get or calculate ATR once
+    if 'atr' in df.columns:
+        atr = df['atr']
+    else:
+        high_low = df['high'] - df['low'] if 'high' in df.columns else df['close'].diff().abs()
+        atr = high_low.rolling(atr_period, min_periods=1).mean()
+
+    # Normalize ATR to percentage terms
+    atr_pct = atr / df['close']
+
+    labels_dict = {}
+    valid_masks_dict = {}
+    meta_dict = {}
+
+    for horizon_name, future_window in horizons.items():
+        # Adjust smooth window based on horizon (shorter horizon = less smoothing)
+        # This prevents over-smoothing short horizons
+        adjusted_smooth = min(smooth_window, max(2, future_window // 2))
+
+        # Calculate smoothed future return for this horizon
+        future_smoothed = df['close'].shift(-future_window).rolling(
+            adjusted_smooth, min_periods=1
+        ).mean()
+        future_return = (future_smoothed / df['close']) - 1
+
+        # Threshold: at least min_move_atr * ATR move
+        threshold = min_move_atr * atr_pct
+
+        # Create labels: 0=Down, 1=Up, NaN=Excluded
+        labels = pd.Series(index=df.index, dtype=np.float32)
+        labels[:] = np.nan
+
+        down_mask = future_return < -threshold
+        up_mask = future_return > threshold
+
+        labels[down_mask] = 0  # Down
+        labels[up_mask] = 1    # Up
+
+        # Valid mask
+        valid_mask = ~labels.isna()
+
+        # Metadata
+        n_down = down_mask.sum()
+        n_up = up_mask.sum()
+        n_neutral = len(df) - n_down - n_up
+
+        meta = {
+            'horizon_name': horizon_name,
+            'future_window': future_window,
+            'adjusted_smooth_window': adjusted_smooth,
+            'n_down': int(n_down),
+            'n_up': int(n_up),
+            'n_neutral_excluded': int(n_neutral),
+            'n_valid': int(valid_mask.sum()),
+            'pct_excluded': float(n_neutral / len(df) * 100),
+            'class_balance': float(n_up / (n_down + n_up)) if (n_down + n_up) > 0 else 0.5
+        }
+
+        labels_dict[horizon_name] = labels
+        valid_masks_dict[horizon_name] = valid_mask
+        meta_dict[horizon_name] = meta
+
+        logger.info(
+            f"Multi-horizon target [{horizon_name}]: {n_down} Down, {n_up} Up, "
+            f"{n_neutral} excluded ({meta['pct_excluded']:.1f}%)"
+        )
+
+    return labels_dict, valid_masks_dict, meta_dict
+
+
 # =============================================================================
 # Market Sessions
 # =============================================================================

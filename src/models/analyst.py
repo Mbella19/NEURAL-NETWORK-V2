@@ -129,13 +129,70 @@ class MarketAnalyst(nn.Module):
         else:
             self.context_proj = nn.Identity()
 
-        # Trend prediction head (for supervised training)
-        self.trend_head = nn.Sequential(
+        # Direction prediction head (main task - for supervised training)
+        # For binary: outputs 1 logit (use BCEWithLogitsLoss)
+        # For multi-class: outputs num_classes logits
+        self.num_classes = num_classes
+        if num_classes == 2:
+            # Binary classification: single output + sigmoid
+            self.direction_head = nn.Sequential(
+                nn.Linear(context_dim, context_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(context_dim // 2, 1)  # Single logit for BCE
+            )
+        else:
+            # Multi-class classification
+            self.direction_head = nn.Sequential(
+                nn.Linear(context_dim, context_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(context_dim // 2, num_classes)
+            )
+
+        # Multi-horizon prediction heads
+        # These address Target Mismatch by learning at multiple time scales
+        # Shorter horizons (1H, 2H) provide easier "stepping stone" targets
+        if num_classes == 2:
+            # Binary multi-horizon heads (each predicts Up/Down at different horizons)
+            self.horizon_1h_head = nn.Sequential(
+                nn.Linear(context_dim, context_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(context_dim // 2, 1)
+            )
+            self.horizon_2h_head = nn.Sequential(
+                nn.Linear(context_dim, context_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(context_dim // 2, 1)
+            )
+            # Note: direction_head is the 4H head (primary target)
+        else:
+            self.horizon_1h_head = None
+            self.horizon_2h_head = None
+
+        # Auxiliary heads for multi-task learning
+        # These provide regularization and help learn better representations
+
+        # Volatility prediction: predicts future ATR / current ATR (regression)
+        self.volatility_head = nn.Sequential(
             nn.Linear(context_dim, context_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(context_dim // 2, num_classes)
+            nn.Linear(context_dim // 2, 1)
         )
+
+        # Regime prediction: trending (1) vs ranging (0) (binary)
+        self.regime_head = nn.Sequential(
+            nn.Linear(context_dim, context_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(context_dim // 2, 1)
+        )
+
+        # Legacy alias for compatibility with existing code
+        self.trend_head = self.direction_head
 
         # Initialize weights
         self._init_weights()
@@ -144,40 +201,42 @@ class MarketAnalyst(nn.Module):
         """
         Initialize linear layer weights for stable training.
         """
-        for module in [self.context_proj]:
+        # Initialize all Sequential modules
+        modules_to_init = [
+            self.context_proj,
+            self.direction_head,
+            self.volatility_head,
+            self.regime_head
+        ]
+
+        # Add multi-horizon heads if they exist
+        if self.horizon_1h_head is not None:
+            modules_to_init.append(self.horizon_1h_head)
+        if self.horizon_2h_head is not None:
+            modules_to_init.append(self.horizon_2h_head)
+
+        for module in modules_to_init:
             if isinstance(module, nn.Sequential):
                 for layer in module:
                     if isinstance(layer, nn.Linear):
                         nn.init.xavier_uniform_(layer.weight)
                         if layer.bias is not None:
-                            nn.init.zeros_(layer.bias)
-        
-        # Special initialization for trend_head to match target scale
-        if isinstance(self.trend_head, nn.Sequential):
-            for layer in self.trend_head:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    if layer.bias is not None:
-                        nn.init.zeros_(layer.bias)
+                            # FIXED: Was zeros_ which creates 50% equilibrium trap
+                            # Small positive bias breaks symmetry, prevents the model
+                            # from getting stuck at sigmoid(0)=0.5 for all predictions
+                            nn.init.constant_(layer.bias, 0.1)
 
-    def forward(
+    def _encode_and_fuse(
         self,
         x_15m: torch.Tensor,
         x_1h: torch.Tensor,
         x_4h: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Full forward pass for training.
-
-        Args:
-            x_15m: 15-minute features [batch, seq_len, features]
-            x_1h: 1-hour features [batch, seq_len, features]
-            x_4h: 4-hour features [batch, seq_len, features]
+        Internal method: encode all timeframes and fuse to context.
 
         Returns:
-            Tuple of:
-                - context: Context vector [batch, context_dim]
-                - prediction: Class logits [batch, num_classes]
+            context: Context vector [batch, context_dim]
         """
         # Ensure float32
         x_15m = x_15m.float()
@@ -195,10 +254,63 @@ class MarketAnalyst(nn.Module):
         # Project to context dimension
         context = self.context_proj(fused)  # [batch, context_dim]
 
-        # Predict trend
-        prediction = self.trend_head(context)  # [batch, num_classes]
+        return context
 
-        return context, prediction
+    def forward(
+        self,
+        x_15m: torch.Tensor,
+        x_1h: torch.Tensor,
+        x_4h: torch.Tensor,
+        return_aux: bool = False,
+        return_multi_horizon: bool = False
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Full forward pass for training.
+
+        Args:
+            x_15m: 15-minute features [batch, seq_len, features]
+            x_1h: 1-hour features [batch, seq_len, features]
+            x_4h: 4-hour features [batch, seq_len, features]
+            return_aux: If True, also return auxiliary predictions (volatility, regime)
+            return_multi_horizon: If True, also return multi-horizon predictions (1H, 2H)
+
+        Returns:
+            If return_aux=False and return_multi_horizon=False (default):
+                Tuple of (context, direction_logits)
+            If return_aux=True:
+                Tuple of (context, direction_logits, volatility_pred, regime_pred)
+            If return_multi_horizon=True:
+                Tuple of (context, direction_logits, horizon_1h_logits, horizon_2h_logits)
+            If both True:
+                Tuple of (context, direction_logits, volatility_pred, regime_pred,
+                          horizon_1h_logits, horizon_2h_logits)
+        """
+        # Encode and fuse to context
+        context = self._encode_and_fuse(x_15m, x_1h, x_4h)
+
+        # Main direction prediction (4H horizon)
+        direction = self.direction_head(context)  # [batch, 1] for binary, [batch, n] for multi
+
+        if not return_aux and not return_multi_horizon:
+            # Backward compatible: return only context and direction
+            return context, direction
+
+        # Build return tuple based on what's requested
+        result = [context, direction]
+
+        if return_aux:
+            # Auxiliary predictions
+            volatility = self.volatility_head(context).squeeze(-1)  # [batch]
+            regime = self.regime_head(context).squeeze(-1)  # [batch]
+            result.extend([volatility, regime])
+
+        if return_multi_horizon and self.horizon_1h_head is not None:
+            # Multi-horizon predictions (only for binary mode)
+            horizon_1h = self.horizon_1h_head(context)  # [batch, 1]
+            horizon_2h = self.horizon_2h_head(context)  # [batch, 1]
+            result.extend([horizon_1h, horizon_2h])
+
+        return tuple(result)
 
     @torch.no_grad()
     def get_context(
@@ -241,10 +353,21 @@ class MarketAnalyst(nn.Module):
         Returns:
             Tuple of:
                 - context: Context vector [batch, context_dim]
-                - probs: Softmax probabilities [batch, num_classes]
+                - probs: Probabilities [batch, num_classes]
+                    For binary: [batch, 2] as [p_down, p_up]
+                    For multi-class: [batch, num_classes] via softmax
         """
         context, logits = self.forward(x_15m, x_1h, x_4h)
-        probs = torch.softmax(logits, dim=-1)
+
+        if self.num_classes == 2:
+            # Binary: logits is [batch, 1], convert to [batch, 2] probs
+            p_up = torch.sigmoid(logits)  # [batch, 1]
+            p_down = 1 - p_up
+            probs = torch.cat([p_down, p_up], dim=-1)  # [batch, 2]
+        else:
+            # Multi-class: use softmax
+            probs = torch.softmax(logits, dim=-1)
+
         return context, probs
 
     def freeze(self):
@@ -350,8 +473,23 @@ def load_analyst(
     # Load checkpoint
     checkpoint = torch.load(path, map_location=device or 'cpu')
 
-    # Create model
-    # Create model
+    # Check architecture type
+    architecture = 'transformer'
+    if 'config' in checkpoint:
+        architecture = checkpoint['config'].get('architecture', 'transformer')
+
+    # Dispatch to TCN loader if needed
+    if architecture == 'tcn':
+        from .tcn_analyst import load_tcn_analyst
+        # We can pass the path directly as load_tcn_analyst will load it again
+        # OR we can modify load_tcn_analyst to accept a loaded checkpoint.
+        # For simplicity and to avoid modifying tcn_analyst.py right now, we'll just call it with the path.
+        # However, we already loaded the checkpoint here. 
+        # Let's just delegate completely.
+        del checkpoint
+        return load_tcn_analyst(path, feature_dims, device, freeze)
+
+    # Create Transformer model
     if 'config' in checkpoint:
         saved_config = checkpoint['config']
         from config.settings import config as global_config

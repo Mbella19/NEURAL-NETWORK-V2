@@ -82,10 +82,12 @@ class DataConfig:
     })
 
     # Lookback windows (number of candles)
+    # v9 FIX: INCREASED lookbacks to provide proper context WITHOUT overlapping prediction window
+    # Rule: lookback > prediction horizon to avoid temporal confusion
     lookback_windows: Dict[str, int] = field(default_factory=lambda: {
-        '15m': 20,   # 5 hours (was 48/12h)
-        '1h': 24,    # 24 hours of 1H candles
-        '4h': 12     # 48 hours of 4H candles
+        '15m': 48,   # 12 hours - 6x prediction horizon (proper context)
+        '1h': 16,    # 16 hours - captures full trading session
+        '4h': 6      # 24 hours - captures daily trend
     })
 
     # Train/validation/test splits
@@ -99,53 +101,94 @@ class DataConfig:
 
 @dataclass
 class AnalystConfig:
-    """Market Analyst (Transformer) configuration."""
-    d_model: int = 128          # Increased from 32/64
-    nhead: int = 4              # Increased from 2
-    num_layers: int = 4         # Increased from 1/2
-    dim_feedforward: int = 256  # Increased from 64/128
-    dropout: float = 0.3        # Adjusted for larger model
-    context_dim: int = 128      # Matched to d_model
+    """Market Analyst configuration (supports both Transformer and TCN)."""
+    # v13: Architecture selection - TCN is more stable for binary classification
+    architecture: str = "tcn"   # "transformer" or "tcn" (TCN recommended)
 
-    batch_size: int = 128       # Increased to smooth out gradients
-    learning_rate: float = 1e-4 # Reduced 10x to prevent divergence
-    weight_decay: float = 1e-2  # INCREASED to stop overfitting
+    # Shared architecture settings
+    d_model: int = 64           # Hidden dimension
+    nhead: int = 4              # Transformer only: attention heads
+    num_layers: int = 2         # Transformer only: encoder layers
+    dim_feedforward: int = 256  # Transformer only: FFN hidden dim
+    dropout: float = 0.2        # v14: Reduced from 0.3 - aux losses provide regularization
+    context_dim: int = 64       # Output context vector dimension
+
+    # TCN-specific settings (v13)
+    tcn_num_blocks: int = 3     # Number of residual blocks (dilations: 1, 2, 4)
+    tcn_kernel_size: int = 3    # Convolution kernel size
+
+    batch_size: int = 128       # Keep at 128
+    learning_rate: float = 1e-4 # REDUCED from 3e-4 - more stable convergence
+    weight_decay: float = 1e-4  # FIXED: Was 1e-2 (100x too high!) - standard value
     max_epochs: int = 100
-    patience: int = 15          
+    patience: int = 25  # Increased from 15 - more time to find recall balance
 
     cache_clear_interval: int = 50
-    future_window: int = 16     # 4 Hours (Capture the Session trend)
-    smooth_window: int = 12     # 3 Hours (Smooth enough to remove noise, sharp enough to keep signal)
-    num_classes: int = 3        
-    class_std_thresholds: Tuple[float, float] = (-0.15, 0.15)   # Narrowed to force trend detection
+
+    # v9 FIX: TARGET DEFINITION - reduced horizon and smoothing for more predictable signal
+    future_window: int = 8      # 2 Hours (was 4H) - shorter = more predictable
+    smooth_window: int = 4      # 1 Hour (was 3H) - less smoothing = preserves signal
+
+    # Binary classification mode
+    num_classes: int = 2        # Binary: 0=Down, 1=Up
+    use_binary_target: bool = True  # Use binary direction target
+    min_move_atr_threshold: float = 0.15  # v9 FIX: Was 0.3 - lower = 4x more training data
+
+    # Auxiliary losses (multi-task learning)
+    # v14: RE-ENABLED - easier tasks (regime ~70%, volatility ~65%) provide
+    # stronger gradients to shared encoder, reducing overfitting and improving direction
+    use_auxiliary_losses: bool = True   # v14: Enabled for multi-task learning
+    aux_volatility_weight: float = 0.2  # v14: Volatility prediction (MSE)
+    aux_regime_weight: float = 0.4      # v14: INCREASED - Regime is easier, stronger gradients
+
+    # Gradient accumulation for smoother updates (effective batch = batch_size * steps)
+    gradient_accumulation_steps: int = 2  # Effective batch size = 128 * 2 = 256
+
+    # Multi-horizon prediction (addresses Target Mismatch)
+    # DISABLED: Gradient conflicts between horizons caused recall oscillation
+    use_multi_horizon: bool = False  # Was True - disabled to focus on single target
+    multi_horizon_weights: Dict[str, float] = field(default_factory=lambda: {
+        '1h': 0.0,   # 1-hour horizon weight - disabled
+        '2h': 0.0,   # 2-hour horizon weight - disabled
+        '4h': 1.0    # 4-hour horizon weight (primary target)
+    })
+
+    # Legacy 3-class config (kept for compatibility)
+    class_std_thresholds: Tuple[float, float] = (-0.15, 0.15)
 
     # Input Lookback Windows (Must match DataConfig)
-    lookback_15m: int = 20      # 5 Hours
-    lookback_1h: int = 24       # 24 Hours
-    lookback_4h: int = 12       # 48 Hours
+    # v9 FIX: INCREASED lookbacks to provide proper context WITHOUT overlapping prediction window
+    lookback_15m: int = 48      # 12 Hours - 6x prediction horizon (proper context)
+    lookback_1h: int = 16       # 16 Hours - captures full trading session
+    lookback_4h: int = 6        # 24 Hours - captures daily trend
 
 
 @dataclass
 class TradingConfig:
     """Trading environment configuration."""
     spread_pips: float = 1.5
+    slippage_pips: float = 1.0  # Realistic slippage: 0.5-2 pips per execution
+    
+    # NEW: Enforce Analyst Alignment (Action Masking)
+    # If True, Agent can ONLY trade in direction of Analyst (or Flat)
+    enforce_analyst_alignment: bool = True
     
     # NEW: Risk-Based Sizing (Not Fixed Lots)
     risk_multipliers: Tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)
     
     # NEW: ATR-Based Stops (Not Fixed Pips)
-    sl_atr_multiplier: float = 1.5
+    sl_atr_multiplier: float = 1.0
     tp_atr_multiplier: float = 3.0
     
     # Risk Limits
     max_position_size: float = 5.0
     
     # Reward Params
-    fomo_penalty: float = -0.2
+    fomo_penalty: float = -0.5  # Increased penalty (was -0.2) to force participation
     chop_penalty: float = -0.1
     fomo_threshold_atr: float = 2.0
     chop_threshold: float = 60.0
-    reward_scaling: float = 0.1
+    reward_scaling: float = 0.2 # Increased reward (was 0.1) to make winning more attractive
     
     # These are mostly unused now but keep for compatibility if needed
     use_stop_loss: bool = True

@@ -226,9 +226,15 @@ class TrainingLogger:
         val_direction_acc: float = 0.0,
         lr: float = 0.0,
         grad_norm: float = 0.0,
-        extra_metrics: Optional[Dict[str, float]] = None
+        extra_metrics: Optional[Dict[str, float]] = None,
+        skip_patience_update: bool = False
     ):
-        """Log epoch summary with all metrics."""
+        """Log epoch summary with all metrics.
+
+        Args:
+            skip_patience_update: If True, don't update internal patience counter
+                (useful when caller manages patience externally based on different criterion)
+        """
         import time
 
         epoch_time = time.time() - self.epoch_start_time if self.epoch_start_time else 0
@@ -250,16 +256,19 @@ class TrainingLogger:
         )
         self.epoch_history.append(metrics)
 
-        # Check for improvement
-        improved = val_loss < self.best_val_loss
-        if improved:
-            self.best_val_loss = val_loss
-            self.best_val_acc = val_acc
-            self.epochs_without_improvement = 0
-            improvement_str = " ★ NEW BEST"
-        else:
-            self.epochs_without_improvement += 1
-            improvement_str = ""
+        # Check for improvement (skip if caller manages patience externally)
+        if not skip_patience_update:
+            improved = val_loss < self.best_val_loss
+            if improved:
+                self.best_val_loss = val_loss
+                self.best_val_acc = val_acc
+                self.epochs_without_improvement = 0
+            else:
+                self.epochs_without_improvement += 1
+
+        # Determine improvement string from patience counter
+        # (works whether patience is managed internally or externally)
+        improvement_str = " ★ NEW BEST" if self.epochs_without_improvement == 0 else ""
 
         # Log summary
         self.logger.info("-" * 70)

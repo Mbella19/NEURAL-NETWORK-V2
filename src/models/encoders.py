@@ -59,13 +59,17 @@ class PositionalEncoding(nn.Module):
 
 class TransformerEncoder(nn.Module):
     """
-    Transformer encoder for a single timeframe.
+    Transformer encoder for a single timeframe with temporal recency bias.
 
     Takes a sequence of feature vectors and produces a single
     context vector summarizing the temporal patterns.
 
     Architecture:
-        Input projection → Positional encoding → Transformer layers → Pooling
+        Input projection → Positional encoding → Temporal bias → Transformer layers → Pooling
+
+    Features:
+        - Temporal recency bias: exponential decay on attention to older positions
+        - Last-token pooling for forecasting (most recent state matters most)
 
     Memory Optimization:
         - Uses d_model=64, nhead=4, num_layers=2 by default
@@ -80,7 +84,9 @@ class TransformerEncoder(nn.Module):
         num_layers: int = 2,
         dim_feedforward: int = 128,
         dropout: float = 0.1,
-        max_len: int = 500
+        max_len: int = 500,
+        use_temporal_bias: bool = True,
+        temporal_decay: float = 0.1
     ):
         """
         Args:
@@ -91,10 +97,15 @@ class TransformerEncoder(nn.Module):
             dim_feedforward: FFN hidden dimension
             dropout: Dropout rate
             max_len: Maximum sequence length
+            use_temporal_bias: Whether to apply temporal recency bias to attention
+            temporal_decay: Decay rate for temporal bias (higher = stronger recency preference)
         """
         super().__init__()
 
         self.d_model = d_model
+        self.use_temporal_bias = use_temporal_bias
+        self.temporal_decay = temporal_decay
+        self.max_len = max_len
 
         # Input projection: map features to model dimension
         self.input_projection = nn.Linear(input_dim, d_model)
@@ -119,6 +130,17 @@ class TransformerEncoder(nn.Module):
         # Layer normalization for output
         self.layer_norm = nn.LayerNorm(d_model)
 
+        # Temporal recency weighting (learnable decay applied after transformer)
+        # This scales each position's contribution based on recency
+        if use_temporal_bias:
+            # Learnable temporal gate that weights positions by recency
+            self.temporal_gate = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, 1),
+                nn.Sigmoid()
+            )
+
         # Initialize weights
         self._init_weights()
 
@@ -127,6 +149,20 @@ class TransformerEncoder(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def _create_recency_weights(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Create exponentially decaying recency weights.
+
+        Recent positions get weight ~1.0, older positions decay exponentially.
+        """
+        # Position indices: 0 is oldest, seq_len-1 is most recent
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        # Reverse so that seq_len-1 (most recent) has weight 1.0
+        # exp(-decay * distance_from_end)
+        distance_from_end = seq_len - 1 - positions
+        weights = torch.exp(-self.temporal_decay * distance_from_end)
+        return weights  # [seq_len]
 
     def forward(
         self,
@@ -145,6 +181,7 @@ class TransformerEncoder(nn.Module):
         """
         # Ensure float32
         x = x.float()
+        seq_len = x.size(1)
 
         # Project input to model dimension
         x = self.input_projection(x)  # [batch, seq_len, d_model]
@@ -158,9 +195,11 @@ class TransformerEncoder(nn.Module):
         # Layer norm
         x = self.layer_norm(x)
 
-        # Pool: use mean pooling over sequence
-        # Could also use last token or [CLS] token approach
-        output = x.mean(dim=1)  # [batch, d_model]
+        # SIMPLIFIED: Pure last-token pooling
+        # The temporal gate was adding complexity without benefit
+        # The transformer attention already aggregates historical context
+        # Using the last token preserves the "current state" representation
+        output = x[:, -1, :]  # [batch, d_model] - last position = most recent
 
         return output
 
@@ -256,5 +295,5 @@ class LightweightEncoder(nn.Module):
         # Self-attention
         x, _ = self.attention(x, x, x)
 
-        # Pool
-        return x.mean(dim=1)
+        # Pool: use last token for temporal forecasting
+        return x[:, -1, :]

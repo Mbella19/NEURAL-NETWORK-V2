@@ -235,18 +235,12 @@ class SniperAgent:
         if callback is not None:
             callback_list.append(callback)
 
-        # Add evaluation callback if eval_env provided
-        if eval_env is not None and save_path is not None:
-            eval_callback = EvalCallback(
-                eval_env,
-                best_model_save_path=save_path,
-                log_path=save_path,
-                eval_freq=eval_freq,
-                deterministic=True,
-                render=False,
-                verbose=self.verbose
-            )
-            callback_list.append(eval_callback)
+        # NOTE: We deliberately DO NOT use EvalCallback for model selection.
+        # Using eval performance to select the "best" model causes overfitting
+        # to the eval set. Instead, we save the FINAL model after all training.
+        # The eval_env is only used for monitoring, not selection.
+        #
+        # If you want periodic eval logging (without selection), add custom callback.
 
         # Train
         if self.verbose > 0:

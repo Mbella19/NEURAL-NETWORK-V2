@@ -452,6 +452,7 @@ def create_trading_env(
     """
     # Default configuration
     spread_pips = 1.5
+    slippage_pips = 1.0     # Realistic slippage: 0.5-2 pips per trade execution
     fomo_penalty = -0.2     # Reduced: ~2 pip equivalent (was -2.0)
     chop_penalty = -0.1     # Reduced: ~1 pip equivalent (was -1.0)
     fomo_threshold_atr = 2.0
@@ -469,10 +470,16 @@ def create_trading_env(
     
     # Volatility Sizing
     volatility_sizing = True
+    volatility_sizing = True
     risk_pips_target = 15.0
+    
+    # Analyst Alignment - Force agent to trade only in analyst's predicted direction
+    # This gives agent the 51-53% directional edge; agent learns WHEN and HOW MUCH to trade
+    enforce_analyst_alignment = True
 
     if config is not None:
         spread_pips = getattr(config, 'spread_pips', spread_pips)
+        slippage_pips = getattr(config, 'slippage_pips', slippage_pips)
         fomo_penalty = getattr(config, 'fomo_penalty', fomo_penalty)
         chop_penalty = getattr(config, 'chop_penalty', chop_penalty)
         fomo_threshold_atr = getattr(config, 'fomo_threshold_atr', fomo_threshold_atr)
@@ -488,9 +495,15 @@ def create_trading_env(
         # Volatility Sizing
         volatility_sizing = getattr(config, 'volatility_sizing', volatility_sizing)
         risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
+        # Analyst Alignment
+        enforce_analyst_alignment = getattr(config, 'enforce_analyst_alignment', enforce_analyst_alignment)
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
+        # Get num_classes from analyst (binary=2, multi-class=3)
+        num_classes = getattr(analyst_model, 'num_classes', 2)
+    else:
+        num_classes = 2  # Default to binary
 
     env = TradingEnv(
         data_15m=data_15m,
@@ -501,6 +514,7 @@ def create_trading_env(
         analyst_model=analyst_model,
         context_dim=context_dim,
         spread_pips=spread_pips,
+        slippage_pips=slippage_pips,
         fomo_penalty=fomo_penalty,
         chop_penalty=chop_penalty,
         fomo_threshold_atr=fomo_threshold_atr,
@@ -520,7 +534,11 @@ def create_trading_env(
         use_regime_sampling=use_regime_sampling,
         # Volatility Sizing
         volatility_sizing=volatility_sizing,
-        risk_pips_target=risk_pips_target
+        risk_pips_target=risk_pips_target,
+        # Classification mode
+        num_classes=num_classes,
+        # Analyst Alignment
+        enforce_analyst_alignment=enforce_analyst_alignment
     )
 
     return env
@@ -557,7 +575,7 @@ def train_agent(
     # Setup logging for this run
     log_dir = Path(save_path)
     log_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(str(log_dir), name="agent_training")
+    setup_logging(str(log_dir), name=__name__)
 
     # Device selection
     if device is None:
