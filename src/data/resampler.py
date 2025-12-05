@@ -94,6 +94,10 @@ def resample_ohlcv(
 
         # Forward-fill missing values
         resampled = resampled.ffill()
+    else:
+        # If NOT filling gaps, drop the empty bins created by resample()
+        # These are the weekend gaps we want to remove
+        resampled = resampled.dropna()
 
     # Ensure float32
     for col in resampled.columns:
@@ -129,7 +133,8 @@ def resample_all_timeframes(
     result = {}
     for name, freq in timeframes.items():
         logger.info(f"Resampling to {name} ({freq})...")
-        result[name] = resample_ohlcv(df_1m, freq)
+        # Disable gap filling to remove weekend flat lines
+        result[name] = resample_ohlcv(df_1m, freq, fill_gaps=False)
 
     return result
 

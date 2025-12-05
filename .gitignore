@@ -37,27 +37,28 @@ env/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# Data files (too large for git)
-data/raw/*.csv
-data/processed/*.parquet
-*.csv
-*.parquet
+# Data files (Exclude entire directory)
+data/
 
-# Model checkpoints and serialized objects (too large for git)
-models/analyst/*.pt
-models/analyst/*.pkl
-models/agent/*.zip
+# Model checkpoints (Exclude entire directory to avoid large binaries)
+models/
 *.pt
 *.pth
 *.zip
 *.pkl
 
-# Results
-results/
+# Node modules
+node_modules/
+frontend/node_modules/
 
-# Logs
+# Results and Logs
+results/
 *.log
 logs/
+
+# AI Tool Artifacts
+.aider*
+.gemini*
 
 # OS files
 .DS_Store

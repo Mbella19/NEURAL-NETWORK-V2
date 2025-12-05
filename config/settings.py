@@ -106,12 +106,12 @@ class AnalystConfig:
     architecture: str = "tcn"   # "transformer" or "tcn" (TCN recommended)
 
     # Shared architecture settings
-    d_model: int = 64           # Hidden dimension
+    d_model: int = 32           # Hidden dimension (Reduced to 32)
     nhead: int = 4              # Transformer only: attention heads
     num_layers: int = 2         # Transformer only: encoder layers
-    dim_feedforward: int = 256  # Transformer only: FFN hidden dim
-    dropout: float = 0.2        # v14: Reduced from 0.3 - aux losses provide regularization
-    context_dim: int = 64       # Output context vector dimension
+    dim_feedforward: int = 128  # Transformer only: FFN hidden dim (4x d_model)
+    dropout: float = 0.3        # v14: Standard regularization for small model
+    context_dim: int = 32       # Output context vector dimension (Matched to d_model)
 
     # TCN-specific settings (v13)
     tcn_num_blocks: int = 3     # Number of residual blocks (dilations: 1, 2, 4)
@@ -121,18 +121,18 @@ class AnalystConfig:
     learning_rate: float = 1e-4 # REDUCED from 3e-4 - more stable convergence
     weight_decay: float = 1e-4  # FIXED: Was 1e-2 (100x too high!) - standard value
     max_epochs: int = 100
-    patience: int = 25  # Increased from 15 - more time to find recall balance
+    patience: int = 50  # Increased from 15 - more time to find recall balance
 
     cache_clear_interval: int = 50
 
     # v9 FIX: TARGET DEFINITION - reduced horizon and smoothing for more predictable signal
-    future_window: int = 8      # 2 Hours (was 4H) - shorter = more predictable
-    smooth_window: int = 4      # 1 Hour (was 3H) - less smoothing = preserves signal
+    future_window: int = 16      # 2 Hours (was 4H) - shorter = more predictable
+    smooth_window: int = 8      # 1 Hour (was 3H) - less smoothing = preserves signal
 
     # Binary classification mode
     num_classes: int = 2        # Binary: 0=Down, 1=Up
     use_binary_target: bool = True  # Use binary direction target
-    min_move_atr_threshold: float = 0.15  # v9 FIX: Was 0.3 - lower = 4x more training data
+    min_move_atr_threshold: float = 7  # v9 FIX: Was 0.3 - lower = 4x more training data
 
     # Auxiliary losses (multi-task learning)
     # v14: RE-ENABLED - easier tasks (regime ~70%, volatility ~65%) provide
@@ -166,12 +166,15 @@ class AnalystConfig:
 @dataclass
 class TradingConfig:
     """Trading environment configuration."""
-    spread_pips: float = 1.5
-    slippage_pips: float = 1.0  # Realistic slippage: 0.5-2 pips per execution
+    spread_pips: float = 0.2    # Razor/Raw spread (was 1.0)
+    slippage_pips: float = 0.5  # Includes commission + slippage (was 0.5)
     
     # NEW: Enforce Analyst Alignment (Action Masking)
     # If True, Agent can ONLY trade in direction of Analyst (or Flat)
-    enforce_analyst_alignment: bool = True
+    # DISABLED: Soft masking breaks PPO gradients - agent samples action X, gets
+    # masked to Flat, but PPO updates as if X led to the reward. This causes
+    # frozen action distributions and no learning.
+    enforce_analyst_alignment: bool = False
     
     # NEW: Risk-Based Sizing (Not Fixed Lots)
     risk_multipliers: Tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)
@@ -184,18 +187,20 @@ class TradingConfig:
     max_position_size: float = 5.0
     
     # Reward Params
-    fomo_penalty: float = -0.5  # Increased penalty (was -0.2) to force participation
-    chop_penalty: float = -0.1
-    fomo_threshold_atr: float = 2.0
-    chop_threshold: float = 60.0
-    reward_scaling: float = 0.2 # Increased reward (was 0.1) to make winning more attractive
+    # FIX: Previous penalties were 10x too high, dominating PnL rewards
+    # A 50-pip trade at 0.2 scaling = 10 reward, but 30x FOMO @ -0.5 = -15 penalty
+    fomo_penalty: float = -0.05   # Was -0.5 (10x reduction - now ~2.5 pip equivalent)
+    chop_penalty: float = -0.01   # Was -0.05 (5x reduction - now ~0.5 pip equivalent)
+    fomo_threshold_atr: float = 2.0  # Was 1.0 (only trigger on significant moves)
+    chop_threshold: float = 80.0     # Was 70.0 (only extreme chop triggers penalty)
+    reward_scaling: float = 0.5      # Was 0.2 (PnL signal now 2.5x stronger vs penalties)
     
     # These are mostly unused now but keep for compatibility if needed
     use_stop_loss: bool = True
     use_take_profit: bool = True
     
     # Environment settings
-    max_steps_per_episode: int = 2000
+    max_steps_per_episode: int = 500    # Reduced to ~1 week (was 2000) for rapid regime cycling
     initial_balance: float = 10000.0
 
 
@@ -204,14 +209,15 @@ class AgentConfig:
     """PPO Sniper Agent configuration."""
 
     # PPO hyperparameters (from CLAUDE.md spec)
-    learning_rate: float = 3e-4
-    n_steps: int = 2048
+    # FIX: Reduced LR for stable convergence, increased entropy to escape local minima
+    learning_rate: float = 1e-4  # Was 3e-4 (reduced for more stable updates)
+    n_steps: int = 512          # Reduced from 2048 to save memory
     batch_size: int = 64
     n_epochs: int = 10
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.01       # Entropy coefficient for exploration
+    ent_coef: float = 0.05       # Was 0.02 (increased to escape frozen action distribution)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -247,6 +253,29 @@ class FeatureConfig:
 
 
 @dataclass
+class VisualizationConfig:
+    """Real-time training visualization configuration."""
+
+    # Enable/disable visualization
+    enabled: bool = True
+
+    # Server settings
+    host: str = "0.0.0.0"
+    port: int = 8000
+
+    # Update rates
+    update_hz: int = 10  # WebSocket updates per second
+
+    # Buffer sizes
+    max_snapshots: int = 10000
+    max_price_bars: int = 500
+    max_trades: int = 100
+
+    # Frontend URL (for CORS)
+    frontend_url: str = "http://localhost:3000"
+
+
+@dataclass
 class Config:
     """Master configuration combining all sub-configs."""
 
@@ -256,6 +285,7 @@ class Config:
     trading: TradingConfig = field(default_factory=TradingConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
+    visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
 
     # Global settings
     seed: int = 42

@@ -45,6 +45,7 @@ from ..utils.metrics import (
     compute_gradient_norm
 )
 from ..utils.visualization import TrainingVisualizer
+from visualization.data_emitter import get_emitter
 
 logger = get_logger(__name__)
 
@@ -887,6 +888,9 @@ class AnalystTrainer:
         # Batch-level tracking
         self.batch_losses = []
         self.batch_grad_norms = []
+        
+        # Data emitter for frontend visualization
+        self.emitter = get_emitter()
 
     def train_epoch(
         self,
@@ -1054,6 +1058,28 @@ class AnalystTrainer:
                 'grad': f'{grad_norm:.4f}',
                 'lr': f'{current_lr:.2e}'
             })
+
+            # Emit data to frontend (throttled)
+            if batch_idx % 5 == 0:  # Emit every 5 batches to avoid flooding
+                # Get activations for visualization
+                activations = None
+                if hasattr(self.model, 'get_activations'):
+                    with torch.no_grad():
+                        _, activations_tensor = self.model.get_activations(x_15m, x_1h, x_4h)
+                        # Convert tensors to lists for JSON serialization
+                        activations = {
+                            k: v[0].cpu().numpy().tolist() for k, v in activations_tensor.items()
+                        }
+
+                self.emitter.push_analyst_epoch(
+                    epoch=epoch,
+                    train_loss=loss_val,
+                    val_loss=0.0, # Not available yet
+                    train_acc=metrics_tracker.compute().get('accuracy', 0.0),
+                    learning_rate=current_lr,
+                    grad_norm=grad_norm,
+                    activations=activations
+                )
 
             # Clean up batch tensors
             del x_15m, x_1h, x_4h, targets, logits, pred_classes, loss

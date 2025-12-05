@@ -365,12 +365,13 @@ class TCNAnalyst(nn.Module):
         x_15m: torch.Tensor,
         x_1h: torch.Tensor,
         x_4h: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Encode all timeframes and fuse to context vector.
 
         Returns:
             context: [batch, context_dim]
+            activations: Dict of encoder outputs [batch, d_model]
         """
         # Encode each timeframe
         enc_15m = self.encoder_15m(x_15m)  # [batch, d_model]
@@ -384,7 +385,13 @@ class TCNAnalyst(nn.Module):
         # Project to context dimension
         context = self.context_proj(fused)  # [batch, context_dim]
 
-        return context
+        activations = {
+            '15m': enc_15m,
+            '1h': enc_1h,
+            '4h': enc_4h
+        }
+
+        return context, activations
 
     def forward(
         self,
@@ -413,7 +420,7 @@ class TCNAnalyst(nn.Module):
             With both: (context, direction, volatility, regime, horizon_1h, horizon_2h)
         """
         # Encode and fuse
-        context = self._encode_and_fuse(x_15m, x_1h, x_4h)
+        context, activations = self._encode_and_fuse(x_15m, x_1h, x_4h)
 
         # Direction prediction
         direction = self.direction_head(context)
@@ -477,6 +484,22 @@ class TCNAnalyst(nn.Module):
             probs = torch.softmax(logits, dim=-1)
 
         return context, probs
+
+    @torch.no_grad()
+    def get_activations(
+        self,
+        x_15m: torch.Tensor,
+        x_1h: torch.Tensor,
+        x_4h: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Get context vector AND internal activations (for visualization).
+
+        Returns:
+            (context, activations_dict)
+        """
+        context, activations = self._encode_and_fuse(x_15m, x_1h, x_4h)
+        return context, activations
 
     def freeze(self):
         """Freeze all parameters for use with RL agent."""

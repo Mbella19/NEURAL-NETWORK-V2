@@ -295,9 +295,11 @@ def step_4_train_analyst(
     feature_cols = [
         'returns', 'volatility',           # Price dynamics
         'pinbar', 'engulfing', 'doji',     # Price action patterns
-        'ema_trend', 'ema_crossover',      # Trend indicators
+        'ema_trend', 'ema_crossover',      # Trend indicators (RESTORED: Context is King)
         'regime', 'sma_distance',          # Regime/trend filters
-        'dist_to_resistance', 'dist_to_support'  # S/R distance
+        'dist_to_resistance', 'dist_to_support',  # S/R distance
+        'bos_bullish', 'bos_bearish',      # Break of Structure (Continuation)
+        'choch_bullish', 'choch_bearish'   # Change of Character (Reversal)
     ]
 
     # Filter to available columns
@@ -460,10 +462,11 @@ def main():
     parser = argparse.ArgumentParser(description='Hybrid EURUSD Trading System Pipeline')
     parser.add_argument('--skip-analyst', action='store_true',
                        help='Skip analyst training (use existing model)')
-    parser.add_argument('--skip-agent', action='store_true',
-                       help='Skip agent training (use existing model)')
-    parser.add_argument('--backtest-only', action='store_true',
-                       help='Only run backtest with existing models')
+    parser.add_argument('--skip-agent', action='store_true', help='Skip agent training (use existing model)')
+    parser.add_argument('--analyst-only', action='store_true', help='Run ONLY data processing and analyst training')
+    parser.add_argument('--backtest-only', action='store_true', help='Only run backtest with existing models')
+    parser.add_argument('--visualization', '-v', action='store_true',
+                       help='Enable real-time visualization dashboard')
     args = parser.parse_args()
 
     # Initialize
@@ -472,6 +475,11 @@ def main():
     logger.info("=" * 60)
 
     config = Config()
+
+    # Enable visualization if requested
+    if args.visualization:
+        config.visualization.enabled = True
+        logger.info("Real-time visualization ENABLED - start dashboard with: python scripts/start_dashboard.py")
     device = get_device()
     logger.info(f"Using device: {device}")
     logger.info(f"PyTorch version: {torch.__version__}")
@@ -533,6 +541,10 @@ def main():
                 )
                 del analyst  # Free memory
                 clear_memory()
+
+                if args.analyst_only:
+                    logger.info("Analyst training complete. stopping as requested (--analyst-only).")
+                    return
 
             # Step 5: Train Agent (on NORMALIZED data)
             if not args.skip_agent:

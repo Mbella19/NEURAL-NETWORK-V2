@@ -32,11 +32,19 @@ from ..agents.sniper_agent import SniperAgent, create_agent
 from ..utils.logging_config import setup_logging, get_logger
 from ..utils.metrics import calculate_trading_metrics, TradingMetrics
 from ..data.features import (
-    compute_regime_labels, 
+    compute_regime_labels,
     add_market_sessions,
     detect_fractals,
     detect_structure_breaks
 )
+
+# Visualization imports (optional, non-blocking)
+try:
+    from visualization import get_emitter
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    get_emitter = None
 
 logger = get_logger(__name__)
 
@@ -56,7 +64,8 @@ class AgentTrainingLogger(BaseCallback):
         self,
         log_dir: Optional[str] = None,
         log_freq: int = 1000,
-        verbose: int = 1
+        verbose: int = 1,
+        enable_visualization: bool = False
     ):
         super().__init__(verbose)
         self.log_dir = Path(log_dir) if log_dir else None
@@ -79,6 +88,13 @@ class AgentTrainingLogger(BaseCallback):
 
         # Training start time
         self.start_time = None
+
+        # Visualization emitter (non-blocking)
+        self.enable_visualization = enable_visualization and VISUALIZATION_AVAILABLE
+        self.emitter = get_emitter() if self.enable_visualization else None
+        self.bar_counter = 0  # Incrementing counter for continuous chart timestamps
+        self.last_price_emitted = 0.0  # Track last price to avoid duplicate bars
+        self._prev_price = 0.0  # Previous price for OHLC generation
 
         if self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -146,14 +162,199 @@ class AgentTrainingLogger(BaseCallback):
             if n_episodes % 10 == 0:
                 self._log_episode_summary(n_episodes)
 
+            # Emit episode end to visualization
+            if self.emitter is not None:
+                try:
+                    self.emitter.push_episode_end(
+                        episode=n_episodes,
+                        episode_reward=self.current_ep_reward,
+                        episode_pnl=self.episode_pnls[-1] if self.episode_pnls else 0.0,
+                        episode_trades=self.episode_trades[-1] if self.episode_trades else 0,
+                        win_rate=win_rate,
+                        episode_length=self.current_ep_length,
+                    )
+                except Exception:
+                    pass
+
             # Reset current episode tracking
             self.current_ep_reward = 0
             self.current_ep_length = 0
             self.current_ep_actions = []
+            self.last_price_emitted = 0.0  # Reset price tracker for new episode
+            # NOTE: bar_counter NOT reset - keep timestamps continuous for proper chart display
+            self._prev_price = 0.0  # Reset previous price for OHLC
 
         # Periodic detailed logging
         if self.n_calls % self.log_freq == 0:
             self._log_training_progress()
+
+        # Emit to visualization dashboard (non-blocking)
+        if self.emitter is not None:
+            try:
+                infos = self.locals.get('infos', [{}])
+                info = infos[0] if infos else {}
+
+                # Get action details
+                action = self.locals.get('actions', [[0, 0]])[0]
+                action_direction = int(action[0]) if isinstance(action, np.ndarray) and len(action) >= 1 else 0
+                action_size = int(action[1]) if isinstance(action, np.ndarray) and len(action) >= 2 else 0
+
+                # Get reward
+                reward = self.locals.get('rewards', [0])[0] if len(self.locals.get('rewards', [])) > 0 else 0
+
+                # Emit step data
+                # Emit step data
+                
+                # --- NEW METRICS EXTRACTION ---
+                action_probs = None
+                size_probs = None
+                value_estimate = 0.0
+                entropy = 0.0
+                
+                try:
+                    if 'new_obs' in self.locals:
+                        obs = self.locals['new_obs']
+                        # Ensure obs is correct shape/type for policy
+                        obs_tensor = torch.as_tensor(obs).to(self.model.device)
+                        
+                        with torch.no_grad():
+                            # Value estimate
+                            values = self.model.policy.predict_values(obs_tensor)
+                            value_estimate = values[0].item()
+                            
+                            # Action probabilities
+                            # For MlpPolicy with MultiDiscrete, we need to extract features then logits
+                            features = self.model.policy.extract_features(obs_tensor)
+                            latent_pi = self.model.policy.mlp_extractor.forward_actor(features)
+                            logits = self.model.policy.action_net(latent_pi)
+                            
+                            # Split logits: [3, 4] -> first 3 for direction, next 4 for size
+                            action_logits = logits[:, :3]
+                            size_logits = logits[:, 3:]
+                            
+                            # Softmax
+                            action_probs_t = torch.softmax(action_logits, dim=1)
+                            size_probs_t = torch.softmax(size_logits, dim=1)
+                            
+                            action_probs = action_probs_t[0].cpu().numpy().tolist()
+                            size_probs = size_probs_t[0].cpu().numpy().tolist()
+                            
+                            # Approximate entropy
+                            dist = self.model.policy.get_distribution(obs_tensor)
+                            entropy = dist.entropy().mean().item()
+                            
+                except Exception:
+                    pass
+                
+                # Construct reward components
+                reward_components = {
+                    'pnl_delta': info.get('pnl_delta', 0.0),
+                    'direction_bonus': 5.0 * info.get('position_size', 0.0) * 0.1 if info.get('direction_bonus') else 0.0, # Approx
+                    'confidence_bonus': info.get('confidence_bonus', 0.0),
+                    'fomo_penalty': -0.2 if info.get('fomo_triggered') else 0.0, # Default from env
+                    'chop_penalty': -0.1 if info.get('chop_triggered') else 0.0, # Default from env
+                    'transaction_cost': 0.0, # Hard to track exact cost here without env access
+                    'total': float(reward)
+                }
+                # ------------------------------
+
+                # Get timestamp for trade markers (use real timestamp if available)
+                if 'ohlc' in info and 'timestamp' in info['ohlc']:
+                    current_bar_timestamp = info['ohlc']['timestamp']
+                else:
+                    # Fallback to synthetic timestamp
+                    base_timestamp = 1700000000
+                    current_bar_timestamp = base_timestamp + (self.bar_counter * 900)
+
+                # Emit trade events with proper timestamp
+                if info.get('trade_opened'):
+                    self.emitter.push_trade(
+                        price=info.get('entry_price', 0.0),
+                        direction=info.get('position', 0),
+                        size=info.get('position_size', 0.0),
+                        is_entry=True,
+                        timestamp=current_bar_timestamp,
+                    )
+                if info.get('trade_closed'):
+                    self.emitter.push_trade(
+                        price=info.get('current_price', 0.0),
+                        direction=info.get('close_direction', 0),
+                        size=info.get('close_size', 0.0),
+                        is_entry=False,
+                        pnl=info.get('pnl', 0.0),
+                        close_reason=info.get('close_reason', 'exit'),
+                        timestamp=current_bar_timestamp,
+                    )
+                    
+                # Extract OHLC from the environment for visualization
+                # Use REAL OHLC data from environment if available
+                ohlc_data = None
+                try:
+                    # Check if environment provides real OHLC data
+                    if 'ohlc' in info:
+                        # Use real OHLC from the trading data
+                        real_ohlc = info['ohlc']
+                        ohlc_data = {
+                            'timestamp': real_ohlc.get('timestamp', 1700000000 + (self.bar_counter * 900)),
+                            'open': real_ohlc['open'],
+                            'high': real_ohlc['high'],
+                            'low': real_ohlc['low'],
+                            'close': real_ohlc['close'],
+                        }
+                        self.bar_counter += 1
+                    else:
+                        # Fallback: Create synthetic OHLC from current_price
+                        current_price = info.get('current_price', 0.0)
+                        if current_price > 0:
+                            prev_price = self._prev_price if self._prev_price > 0 else current_price
+                            base_timestamp = 1700000000  # Nov 2023
+                            bar_timestamp = base_timestamp + (self.bar_counter * 900)
+                            ohlc_data = {
+                                'timestamp': bar_timestamp,
+                                'open': prev_price,
+                                'high': max(prev_price, current_price),
+                                'low': min(prev_price, current_price),
+                                'close': current_price,
+                            }
+                            self.bar_counter += 1
+                            self._prev_price = current_price
+                             
+                except Exception:
+                    pass
+                
+                self.emitter.push_agent_step(
+                    timestep=self.n_calls,
+                    episode=len(self.episode_rewards),
+                    reward=float(reward),
+                    action_direction=action_direction,
+                    action_size=action_size,
+                    position=info.get('position', 0),
+                    position_size=info.get('position_size', 0.0),
+                    entry_price=info.get('entry_price'),
+                    current_price=info.get('current_price', 0.0),
+                    unrealized_pnl=info.get('unrealized_pnl', 0.0),
+                    total_pnl=info.get('total_pnl', 0.0),
+                    n_trades=info.get('n_trades', 0),
+                    atr=info.get('atr', 0.0),
+                    chop=info.get('chop', 50.0),
+                    adx=info.get('adx', 25.0),
+                    regime=info.get('regime', 1),
+                    sma_distance=info.get('sma_distance', 0.0),
+                    p_down=info.get('p_down', 0.5),
+                    p_up=info.get('p_up', 0.5),
+                    attention_weights=info.get('attention_weights'),
+                    sl_level=info.get('sl_level'),
+                    tp_level=info.get('tp_level'),
+                    # New metrics
+                    value_estimate=value_estimate,
+                    action_probs=action_probs,
+                    size_probs=size_probs,
+                    reward_components=reward_components,
+                    ohlc=ohlc_data,  # Add OHLC data
+                    activations=info.get('analyst_activations'), # Add activations
+                )
+            except Exception:
+                pass  # Never block training
 
         return True
 
@@ -434,7 +635,10 @@ def create_trading_env(
     market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training
     market_feat_std: Optional[np.ndarray] = None,   # Pre-computed from training
     regime_labels: Optional[np.ndarray] = None,     # Regime labels for balanced sampling
-    use_regime_sampling: bool = True                # Enable regime-balanced episode starts
+    use_regime_sampling: bool = True,               # Enable regime-balanced episode starts
+    precomputed_analyst_cache: Optional[dict] = None,  # Pre-computed Analyst outputs
+    ohlc_data: Optional[np.ndarray] = None,         # Real OHLC for visualization
+    timestamps: Optional[np.ndarray] = None,        # Real timestamps for visualization
 ) -> TradingEnv:
     """
     Create the trading environment.
@@ -450,15 +654,15 @@ def create_trading_env(
     Returns:
         TradingEnv instance
     """
-    # Default configuration
-    spread_pips = 1.5
-    slippage_pips = 1.0     # Realistic slippage: 0.5-2 pips per trade execution
-    fomo_penalty = -0.2     # Reduced: ~2 pip equivalent (was -2.0)
-    chop_penalty = -0.1     # Reduced: ~1 pip equivalent (was -1.0)
-    fomo_threshold_atr = 2.0
-    chop_threshold = 60.0
-    max_steps = 2000
-    reward_scaling = 0.1    # Scale PnL to balance with penalties
+    # Default configuration (matches config/settings.py fixes)
+    spread_pips = 0.2       # Razor/Raw spread
+    slippage_pips = 0.5     # Includes commission + slippage
+    fomo_penalty = -0.05    # Reduced from -0.5 (was dominating PnL rewards)
+    chop_penalty = -0.01    # Reduced from -0.1
+    fomo_threshold_atr = 2.0  # Only trigger on significant moves
+    chop_threshold = 80.0   # Only extreme chop triggers penalty
+    max_steps = 500
+    reward_scaling = 0.5    # Increased to make PnL signal stronger vs penalties
     context_dim = 64
     
     # Risk Management defaults
@@ -474,8 +678,10 @@ def create_trading_env(
     risk_pips_target = 15.0
     
     # Analyst Alignment - Force agent to trade only in analyst's predicted direction
-    # This gives agent the 51-53% directional edge; agent learns WHEN and HOW MUCH to trade
-    enforce_analyst_alignment = True
+    # DISABLED: Soft masking breaks PPO gradients - agent samples action X, gets
+    # masked to Flat, but PPO updates as if X led to the reward. This causes
+    # frozen action distributions and no learning.
+    enforce_analyst_alignment = False
 
     if config is not None:
         # FIX: Access config.trading for trading parameters (not config directly)
@@ -540,7 +746,12 @@ def create_trading_env(
         # Classification mode
         num_classes=num_classes,
         # Analyst Alignment
-        enforce_analyst_alignment=enforce_analyst_alignment
+        enforce_analyst_alignment=enforce_analyst_alignment,
+        # Pre-computed Analyst cache
+        precomputed_analyst_cache=precomputed_analyst_cache,
+        # Visualization data
+        ohlc_data=ohlc_data,
+        timestamps=timestamps,
     )
 
     return env
@@ -649,6 +860,27 @@ def train_agent(
     logger.info(f"Data shapes: 15m={data_15m.shape}, 1h={data_1h.shape}, 4h={data_4h.shape}")
     logger.info(f"Price range: {close_prices.min():.5f} - {close_prices.max():.5f}")
 
+    # Extract real OHLC data for visualization
+    # Calculate start_idx to match prepare_env_data
+    subsample_1h = 4
+    subsample_4h = 16
+    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
+    n_samples = len(close_prices)
+    
+    ohlc_data = None
+    timestamps = None
+    if all(col in df_15m.columns for col in ['open', 'high', 'low', 'close']):
+        ohlc_data = df_15m[['open', 'high', 'low', 'close']].values[start_idx:start_idx + n_samples].astype(np.float32)
+        logger.info(f"OHLC data extracted: {ohlc_data.shape}, range: {ohlc_data[:, 3].min():.5f} - {ohlc_data[:, 3].max():.5f}")
+        logger.info(f"First 5 OHLC rows:\n{ohlc_data[:5]}") # DEBUG: Check if values are raw or normalized
+    
+    if df_15m.index.dtype == 'datetime64[ns]' or hasattr(df_15m.index, 'to_pydatetime'):
+        try:
+            timestamps = (df_15m.index[start_idx:start_idx + n_samples].astype('int64') // 10**9).values
+            logger.info(f"Timestamps extracted: {len(timestamps)}")
+        except Exception as e:
+            logger.warning(f"Failed to extract timestamps: {e}")
+
     # Split into train/eval
     split_idx = int(0.85 * len(close_prices))
     logger.info(f"Train samples: {split_idx}, Eval samples: {len(close_prices) - split_idx}")
@@ -668,6 +900,12 @@ def train_agent(
         close_prices[split_idx:],
         market_features[split_idx:]
     )
+
+    # Split OHLC data for train/eval
+    train_ohlc = ohlc_data[:split_idx] if ohlc_data is not None else None
+    eval_ohlc = ohlc_data[split_idx:] if ohlc_data is not None else None
+    train_timestamps = timestamps[:split_idx] if timestamps is not None else None
+    eval_timestamps = timestamps[split_idx:] if timestamps is not None else None
 
     # Compute market feature normalization stats from TRAINING data only
     # FIXED: This prevents look-ahead bias by using only training statistics
@@ -691,17 +929,63 @@ def train_agent(
     }
     logger.info(f"Regime distribution: {regime_counts}")
 
-    # Create environments
-    logger.info("Creating training environment...")
+    # Try to load pre-computed Analyst cache for sequential context
+    analyst_cache_path = Path(save_path).parent.parent / 'data' / 'processed' / 'analyst_cache.npz'
+    train_analyst_cache = None
+    eval_analyst_cache = None
+    
+    if analyst_cache_path.exists():
+        logger.info(f"Loading pre-computed Analyst cache from {analyst_cache_path}")
+        try:
+            from .precompute_analyst import load_cached_analyst_outputs
+            full_cache = load_cached_analyst_outputs(str(analyst_cache_path))
+            
+            # Split cache to match train/eval split
+            cache_split_idx = split_idx
+            train_analyst_cache = {
+                'contexts': full_cache['contexts'][:cache_split_idx],
+                'probs': full_cache['probs'][:cache_split_idx],
+                'activations_15m': full_cache.get('activations_15m')[:cache_split_idx] if full_cache.get('activations_15m') is not None else None,
+                'activations_1h': full_cache.get('activations_1h')[:cache_split_idx] if full_cache.get('activations_1h') is not None else None,
+                'activations_4h': full_cache.get('activations_4h')[:cache_split_idx] if full_cache.get('activations_4h') is not None else None,
+            }
+            eval_analyst_cache = {
+                'contexts': full_cache['contexts'][cache_split_idx:],
+                'probs': full_cache['probs'][cache_split_idx:],
+                'activations_15m': full_cache.get('activations_15m')[cache_split_idx:] if full_cache.get('activations_15m') is not None else None,
+                'activations_1h': full_cache.get('activations_1h')[cache_split_idx:] if full_cache.get('activations_1h') is not None else None,
+                'activations_4h': full_cache.get('activations_4h')[cache_split_idx:] if full_cache.get('activations_4h') is not None else None,
+            }
+            logger.info(f"Using sequential Analyst context: train={len(train_analyst_cache['contexts'])}, eval={len(eval_analyst_cache['contexts'])}")
+        except Exception as e:
+            logger.warning(f"Failed to load Analyst cache: {e}")
+            logger.info("Falling back to standard precomputation")
+    else:
+        logger.info("No pre-computed Analyst cache found. Using standard precomputation.")
+        logger.info(f"To enable sequential context, run: python src/training/precompute_analyst.py")
+
+    # Create training environment
+    # FIX: If using regime sampling, we MUST use synthetic timestamps for visualization
+    # Real timestamps will jump (e.g. 2022 -> 2018), causing the chart to look broken/gap-filled.
+    # Synthetic timestamps ensure a continuous, smooth chart for the agent's experience.
+    use_regime_sampling_train = True # Explicitly define this for clarity
+    viz_timestamps = train_timestamps
+    if use_regime_sampling_train:
+        logger.info("Regime sampling enabled: Using SYNTHETIC timestamps for visualization to prevent chart gaps.")
+        viz_timestamps = None
+
     train_env = create_trading_env(
         *train_data,
         analyst_model=analyst,
-        config=config,
+        config=config.trading,
         device=device,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
         regime_labels=train_regime_labels,  # Enable regime-balanced sampling
-        use_regime_sampling=True
+        use_regime_sampling=use_regime_sampling_train,
+        precomputed_analyst_cache=train_analyst_cache,  # Use sequential context if available
+        ohlc_data=train_ohlc,          # Real OHLC for visualization
+        timestamps=viz_timestamps,    # Use synthetic timestamps if regime sampling
     )
 
     logger.info("Creating evaluation environment...")
@@ -713,7 +997,10 @@ def train_agent(
         market_feat_mean=market_feat_mean,  # Use TRAINING stats for eval too
         market_feat_std=market_feat_std,
         regime_labels=None,  # Eval uses random sampling (no regime bias)
-        use_regime_sampling=False
+        use_regime_sampling=False,
+        precomputed_analyst_cache=eval_analyst_cache,  # Use sequential context if available
+        ohlc_data=eval_ohlc,            # Real OHLC for visualization
+        timestamps=eval_timestamps,      # Real timestamps for visualization
     )
 
     # Log environment info
@@ -732,7 +1019,8 @@ def train_agent(
     training_callback = AgentTrainingLogger(
         log_dir=str(log_dir),
         log_freq=5000,
-        verbose=1
+        verbose=1,
+        enable_visualization=config.visualization.enabled
     )
 
     # Train

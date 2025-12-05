@@ -58,14 +58,14 @@ class TradingEnv(gym.Env):
         lookback_15m: int = 48,
         lookback_1h: int = 24,
         lookback_4h: int = 12,
-        spread_pips: float = 1.5,
-        slippage_pips: float = 1.0,   # Realistic slippage: 0.5-2 pips per trade (not modeled before!)
-        fomo_penalty: float = -0.2,   # Further reduced: now ~2 pip equivalent (was -1.0 = 10 pips)
-        chop_penalty: float = -0.1,   # Further reduced: now ~1 pip equivalent per bar (was -0.5 = 5 pips)
-        fomo_threshold_atr: float = 2.0,
-        chop_threshold: float = 60.0,
-        max_steps: int = 2000,
-        reward_scaling: float = 0.1,  # Scale PnL rewards to balance with penalties
+        spread_pips: float = 0.2,     # Razor/Raw spread
+        slippage_pips: float = 0.5,   # Includes commission + slippage
+        fomo_penalty: float = -0.05,  # Reduced from -0.5 (was dominating PnL rewards)
+        chop_penalty: float = -0.01,  # Reduced from -0.1
+        fomo_threshold_atr: float = 2.0,  # Only trigger on significant moves
+        chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
+        max_steps: int = 500,         # ~1 week for rapid regime cycling
+        reward_scaling: float = 0.5,  # Increased to make PnL signal stronger vs penalties
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
@@ -82,10 +82,14 @@ class TradingEnv(gym.Env):
         volatility_sizing: bool = True,  # Scale position size inversely to ATR
         risk_pips_target: float = 15.0,   # Reference risk for normalization (e.g. 15 pips)
         # Classification mode
-        # Classification mode
         num_classes: int = 2,  # Binary (2) vs multi-class (3) - affects observation size
         # Analyst Alignment
-        enforce_analyst_alignment: bool = False  # If True, restrict actions to analyst direction
+        enforce_analyst_alignment: bool = False,  # If True, restrict actions to analyst direction
+        # Pre-computed Analyst outputs (for sequential context)
+        precomputed_analyst_cache: Optional[dict] = None,  # {'contexts': np.ndarray, 'probs': np.ndarray}
+        # OHLC data for visualization (real candle data)
+        ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
+        timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
     ):
         """
         Initialize the trading environment.
@@ -118,6 +122,10 @@ class TradingEnv(gym.Env):
         self.data_4h = data_4h.astype(np.float32)
         self.close_prices = close_prices.astype(np.float32)
         self.market_features = market_features.astype(np.float32)
+        
+        # OHLC data for visualization (real candle data)
+        self.ohlc_data = ohlc_data  # Shape: (n_samples, 4) = [open, high, low, close]
+        self.timestamps = timestamps  # Unix timestamps for real time axis
 
         # Analyst model
         self.analyst = analyst_model
@@ -245,7 +253,24 @@ class TradingEnv(gym.Env):
         # Precompute context vectors if analyst is provided
         self._precomputed_contexts = None
         self._precomputed_probs = None
-        if self.analyst is not None:
+        
+        # Use pre-computed cache if provided (for sequential context)
+        self._precomputed_activations = {}
+        if precomputed_analyst_cache is not None:
+            print("Using pre-computed Analyst cache (sequential context)")
+            self._precomputed_contexts = precomputed_analyst_cache['contexts'].astype(np.float32)
+            self._precomputed_probs = precomputed_analyst_cache['probs'].astype(np.float32)
+            
+            # Load activations if available
+            if 'activations_15m' in precomputed_analyst_cache and precomputed_analyst_cache['activations_15m'] is not None:
+                self._precomputed_activations['15m'] = precomputed_analyst_cache['activations_15m'].astype(np.float32)
+            if 'activations_1h' in precomputed_analyst_cache and precomputed_analyst_cache['activations_1h'] is not None:
+                self._precomputed_activations['1h'] = precomputed_analyst_cache['activations_1h'].astype(np.float32)
+            if 'activations_4h' in precomputed_analyst_cache and precomputed_analyst_cache['activations_4h'] is not None:
+                self._precomputed_activations['4h'] = precomputed_analyst_cache['activations_4h'].astype(np.float32)
+                
+            print(f"Loaded {len(self._precomputed_contexts)} cached context vectors")
+        elif self.analyst is not None:
             self._precompute_contexts()
 
     def _precompute_contexts(self):
@@ -305,17 +330,27 @@ class TradingEnv(gym.Env):
 
         self._precomputed_contexts = np.vstack(contexts).astype(np.float32)
         self._precomputed_probs = np.vstack(probs_list).astype(np.float32)
+        
         print(f"Precomputed {len(self._precomputed_contexts)} context vectors and probabilities")
 
-    def _get_analyst_data(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Get context vector and probabilities for current index."""
+    def _get_analyst_data(self, idx: int) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[Dict[str, np.ndarray]]]:
+        """Get context vector, probabilities, attention weights, and activations for current index."""
         if self._precomputed_contexts is not None and self._precomputed_probs is not None:
             # Use precomputed
             context_idx = idx - self.start_idx
             if 0 <= context_idx < len(self._precomputed_contexts):
+                # Get activations if available
+                activations = None
+                if self._precomputed_activations:
+                    activations = {
+                        k: v[context_idx] for k, v in self._precomputed_activations.items()
+                    }
+                
                 return (
                     self._precomputed_contexts[context_idx],
-                    self._precomputed_probs[context_idx]
+                    self._precomputed_probs[context_idx],
+                    None,
+                    activations
                 )
 
         if self.analyst is not None:
@@ -337,9 +372,33 @@ class TradingEnv(gym.Env):
                     dtype=torch.float32
                 )
                 
-                if hasattr(self.analyst, 'get_probabilities'):
-                    context, probs = self.analyst.get_probabilities(x_15m, x_1h, x_4h)
-                    return context.cpu().numpy().flatten(), probs.cpu().numpy().flatten()
+                if hasattr(self.analyst, 'get_activations'):
+                    context, activations = self.analyst.get_activations(x_15m, x_1h, x_4h)
+                    
+                    # Convert activations to numpy
+                    activations_np = {
+                        k: v.cpu().numpy().flatten() for k, v in activations.items()
+                    }
+                    
+                    # Get probs
+                    if hasattr(self.analyst, 'get_probabilities'):
+                        _, probs = self.analyst.get_probabilities(x_15m, x_1h, x_4h)
+                        probs = probs.cpu().numpy().flatten()
+                    else:
+                        probs = np.array([0.5, 0.5], dtype=np.float32)
+                        
+                    return context.cpu().numpy().flatten(), probs, None, activations_np
+                
+                elif hasattr(self.analyst, 'get_probabilities'):
+                    # Check if get_probabilities returns 3 values (new version)
+                    result = self.analyst.get_probabilities(x_15m, x_1h, x_4h)
+                    if len(result) == 3:
+                        context, probs, weights = result
+                        weights = weights.cpu().numpy().flatten() if weights is not None else None
+                    else:
+                        context, probs = result
+                        weights = None
+                    return context.cpu().numpy().flatten(), probs.cpu().numpy().flatten(), weights, None
                 else:
                     context = self.analyst.get_context(x_15m, x_1h, x_4h)
                     # Dummy probs - match num_classes
@@ -347,7 +406,7 @@ class TradingEnv(gym.Env):
                         probs = np.array([0.5, 0.5], dtype=np.float32)  # Binary: neutral
                     else:
                         probs = np.array([0.0, 1.0, 0.0], dtype=np.float32)  # Multi: neutral
-                    return context.cpu().numpy().flatten(), probs
+                    return context.cpu().numpy().flatten(), probs, None, None
 
         # No analyst - return zeros with correct probs size
         if self.num_classes == 2:
@@ -356,41 +415,37 @@ class TradingEnv(gym.Env):
             dummy_probs = np.array([0.0, 1.0, 0.0], dtype=np.float32)  # Multi: neutral
         return (
             np.zeros(self.context_dim, dtype=np.float32),
-            dummy_probs
+            dummy_probs,
+            None,
+            None
         )
 
     def _get_observation(self) -> np.ndarray:
         """Construct observation vector."""
         # Context vector and probabilities
-        # Context vector and probabilities
-        context, probs = self._get_analyst_data(self.current_idx)
+        # Get Analyst context
+        context, probs, weights, activations = self._get_analyst_data(self.current_idx)
         self.current_probs = probs  # Store for action enforcement
+        self.current_activations = activations # Store for info
 
-        # Calculate Analyst Metrics - handle both binary (2) and multi-class (3) probs
-        # Binary: probs = [p_down, p_up]
-        # Multi-class: probs = [p_down, p_neutral, p_up]
-        probs_safe = np.clip(probs, 1e-6, 1.0)
-        uncertainty = -np.sum(probs_safe * np.log(probs_safe))  # Entropy
-
+        # Calculate Analyst metrics for observation
+        # [p_down, p_up, confidence, edge]
         if len(probs) == 2 or self.num_classes == 2:
-            # Binary classification: [p_down, p_up]
             p_down = probs[0]
             p_up = probs[1] if len(probs) > 1 else 1 - p_down
-            edge = p_up - p_down
             confidence = max(p_down, p_up)
-            analyst_metrics = np.array([
-                p_down, p_up, edge, confidence, uncertainty
-            ], dtype=np.float32)
+            edge = p_up - p_down
+            uncertainty = 1.0 - confidence
+            analyst_metrics = np.array([p_down, p_up, edge, confidence, uncertainty], dtype=np.float32)
         else:
             # Multi-class: [p_down, p_neutral, p_up]
             p_down = probs[0]
             p_neutral = probs[1]
             p_up = probs[2]
+            confidence = np.max(probs) # Use np.max for multi-class confidence
             edge = p_up - p_down
-            confidence = np.max(probs)
-            analyst_metrics = np.array([
-                p_down, p_neutral, p_up, edge, confidence, uncertainty
-            ], dtype=np.float32)
+            uncertainty = 1.0 - confidence
+            analyst_metrics = np.array([p_down, p_neutral, p_up, edge, confidence, uncertainty], dtype=np.float32)
 
         # Position state
         current_price = self.close_prices[self.current_idx]
@@ -726,6 +781,11 @@ class TradingEnv(gym.Env):
                 self.total_pnl -= exec_cost
                 info['trade_opened'] = True
 
+                # CONFIDENCE BONUS: DISABLED
+                # Rewarding entries based on Analyst confidence (regardless of outcome)
+                # adds noise to the reward signal and can encourage overtrading.
+                # The agent should learn from actual PnL, not from Analyst confidence.
+
         elif direction == 2:  # Short
             if self.position == 1:  # Close long first
                 # CRITICAL: Calculate final delta BEFORE resetting position
@@ -767,6 +827,11 @@ class TradingEnv(gym.Env):
                 # Include execution cost in total_pnl to match backtest accounting
                 self.total_pnl -= exec_cost
                 info['trade_opened'] = True
+
+                # CONFIDENCE BONUS: DISABLED
+                # Rewarding entries based on Analyst confidence (regardless of outcome)
+                # adds noise to the reward signal and can encourage overtrading.
+                # The agent should learn from actual PnL, not from Analyst confidence.
 
         # Continuous PnL feedback: reward based on CHANGE in unrealized PnL each step.
         # This prevents the "death spiral" where holding in chop accumulates penalties
@@ -876,8 +941,43 @@ class TradingEnv(gym.Env):
         # Add episode info
         info['step'] = self.steps
         info['position'] = self.position
+        info['position_size'] = self.position_size
+        info['entry_price'] = self.entry_price if self.position != 0 else None
+        info['current_price'] = self.close_prices[min(self.current_idx, len(self.close_prices) - 1)]
+        info['unrealized_pnl'] = self._calculate_unrealized_pnl()
         info['total_pnl'] = self.total_pnl
         info['n_trades'] = len(self.trades)
+
+        # Market features for visualization
+        if len(self.market_features.shape) > 1 and self.current_idx < len(self.market_features):
+            mf = self.market_features[min(self.current_idx, len(self.market_features) - 1)]
+            info['atr'] = float(mf[0]) if len(mf) > 0 else 0.0
+            info['chop'] = float(mf[1]) if len(mf) > 1 else 50.0
+            info['adx'] = float(mf[2]) if len(mf) > 2 else 25.0
+            info['regime'] = int(mf[3]) if len(mf) > 3 else 1
+            info['sma_distance'] = float(mf[4]) if len(mf) > 4 else 0.0
+
+        # Analyst predictions
+        if hasattr(self, 'current_probs') and self.current_probs is not None:
+            info['p_down'] = float(self.current_probs[0])
+            info['p_up'] = float(self.current_probs[-1])
+            
+        # Analyst activations (for visualization)
+        if hasattr(self, 'current_activations') and self.current_activations is not None:
+            info['analyst_activations'] = self.current_activations
+
+        # Real OHLC data for visualization
+        if self.ohlc_data is not None and self.current_idx < len(self.ohlc_data):
+            ohlc = self.ohlc_data[self.current_idx]
+            info['ohlc'] = {
+                'open': float(ohlc[0]),
+                'high': float(ohlc[1]),
+                'low': float(ohlc[2]),
+                'close': float(ohlc[3]),
+            }
+            if self.timestamps is not None and self.current_idx < len(self.timestamps):
+                info['ohlc']['timestamp'] = int(self.timestamps[self.current_idx])
+
         # Pass trades list for win rate calculation (only on episode end to save memory)
         if terminated or truncated:
             info['trades'] = self.trades.copy()
@@ -972,10 +1072,55 @@ def create_env_from_dataframes(
     # Close prices for PnL
     close_prices = df_15m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)
 
+    # Real OHLC data for visualization
+    ohlc_data = None
+    timestamps = None
+    if all(col in df_15m.columns for col in ['open', 'high', 'low', 'close']):
+        ohlc_data = df_15m[['open', 'high', 'low', 'close']].values[start_idx:start_idx + n_samples].astype(np.float32)
+    if df_15m.index.dtype == 'datetime64[ns]' or hasattr(df_15m.index, 'to_pydatetime'):
+        try:
+            timestamps = (df_15m.index[start_idx:start_idx + n_samples].astype('int64') // 10**9).values
+        except:
+            pass  # Keep timestamps as None if conversion fails
+
     # Market features for reward shaping (includes S/R for breakout vs chase detection)
     market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance', 'dist_to_support', 'dist_to_resistance']
     available_cols = [c for c in market_cols if c in df_15m.columns]
     market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+
+    # Extract config values (defaults match config/settings.py fixes)
+    spread_pips = 0.2  # Razor/Raw spread
+    fomo_penalty = -0.05  # Reduced from -0.5 (was dominating PnL rewards)
+    chop_penalty = -0.01  # Reduced from -0.1
+    fomo_threshold_atr = 2.0  # Only trigger on significant moves
+    chop_threshold = 80.0  # Only extreme chop triggers penalty
+    reward_scaling = 0.5  # Increased to make PnL signal stronger vs penalties
+    sl_atr_multiplier = 1.0
+    tp_atr_multiplier = 3.0
+    use_stop_loss = True
+    use_take_profit = True
+    volatility_sizing = True
+    risk_pips_target = 15.0
+    enforce_analyst_alignment = False  # DISABLED: Soft masking breaks PPO gradients
+    num_classes = 2
+
+    if config is not None:
+        spread_pips = getattr(config, 'spread_pips', spread_pips)
+        fomo_penalty = getattr(config, 'fomo_penalty', fomo_penalty)
+        chop_penalty = getattr(config, 'chop_penalty', chop_penalty)
+        fomo_threshold_atr = getattr(config, 'fomo_threshold_atr', fomo_threshold_atr)
+        chop_threshold = getattr(config, 'chop_threshold', chop_threshold)
+        reward_scaling = getattr(config, 'reward_scaling', reward_scaling)
+        sl_atr_multiplier = getattr(config, 'sl_atr_multiplier', sl_atr_multiplier)
+        tp_atr_multiplier = getattr(config, 'tp_atr_multiplier', tp_atr_multiplier)
+        use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
+        use_take_profit = getattr(config, 'use_take_profit', use_take_profit)
+        volatility_sizing = getattr(config, 'volatility_sizing', volatility_sizing)
+        risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
+        enforce_analyst_alignment = getattr(config, 'enforce_analyst_alignment', enforce_analyst_alignment)
+
+    if analyst_model is not None:
+        num_classes = getattr(analyst_model, 'num_classes', 2)
 
     return TradingEnv(
         data_15m=data_15m,
@@ -987,5 +1132,23 @@ def create_env_from_dataframes(
         lookback_15m=lookback_15m,
         lookback_1h=lookback_1h,
         lookback_4h=lookback_4h,
-        device=device
+        device=device,
+        # Config Params
+        spread_pips=spread_pips,
+        fomo_penalty=fomo_penalty,
+        chop_penalty=chop_penalty,
+        fomo_threshold_atr=fomo_threshold_atr,
+        chop_threshold=chop_threshold,
+        reward_scaling=reward_scaling,
+        sl_atr_multiplier=sl_atr_multiplier,
+        tp_atr_multiplier=tp_atr_multiplier,
+        use_stop_loss=use_stop_loss,
+        use_take_profit=use_take_profit,
+        volatility_sizing=volatility_sizing,
+        risk_pips_target=risk_pips_target,
+        enforce_analyst_alignment=enforce_analyst_alignment,
+        num_classes=num_classes,
+        # Visualization data
+        ohlc_data=ohlc_data,
+        timestamps=timestamps,
     )

@@ -56,6 +56,7 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 
 ### Market Analyst (src/models/analyst.py)
 
+- **Architecture**: TCN (default) or Transformer - TCN is more stable for binary classification
 - Separate `TemporalEncoder` for each timeframe (15m, 1H, 4H)
 - `AttentionFusion` layer combines to produce context vector `[batch, context_dim]`
 - **Target**: Smoothed future return (NOT next-step price): `df['close'].shift(-12).rolling(12).mean() / df['close'] - 1`
@@ -77,14 +78,14 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 ```python
 # Continuous PnL: reward based on CHANGE in unrealized PnL each step
 pnl_delta = current_unrealized_pnl - prev_unrealized_pnl
-reward = pnl_delta * reward_scaling  # reward_scaling = 0.1
+reward = pnl_delta * reward_scaling  # reward_scaling = 0.2
 
 # Transaction cost when opening (NOT closing)
 if opened_trade:
     reward -= spread_pips * position_size * reward_scaling
 
-# FOMO: -2.0 if flat during high-momentum moves (|price_move| > 2*ATR)
-# Chop: -1.0 if holding position when CHOP > 60
+# FOMO: -0.5 if flat during high-momentum moves (|price_move| > 1*ATR)
+# Chop: -0.05 if holding position when CHOP > 70
 ```
 
 **CRITICAL FIX**: The environment uses **continuous PnL rewards** (delta each step) instead of exit-only rewards to prevent "death spiral" where holding in choppy markets accumulates penalties with no offsetting reward until exit.
@@ -93,9 +94,9 @@ if opened_trade:
 
 **Stable Baselines 3 Configuration**:
 ```python
-PPO("MlpPolicy", env, learning_rate=3e-4, n_steps=2048, batch_size=64,
+PPO("MlpPolicy", env, learning_rate=3e-4, n_steps=512, batch_size=64,
     n_epochs=10, gamma=0.99, gae_lambda=0.95, clip_range=0.2,
-    ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, device="mps")
+    ent_coef=0.02, vf_coef=0.5, max_grad_norm=0.5, device="mps")
 ```
 
 **MPS Fallback**: If MPS fails, fall back to CPU for SB3 (limited MPS support)
@@ -106,7 +107,7 @@ PPO("MlpPolicy", env, learning_rate=3e-4, n_steps=2048, batch_size=64,
 1. Load & clean 1m OHLCV → resample to 15m/1H/4H → align timeframes → engineer features
 2. Train Market Analyst on smoothed future returns (85% train, 15% val)
 3. Freeze Analyst weights (`param.requires_grad = False`, `.eval()`)
-4. Initialize TradingEnv with frozen Analyst → train PPO agent (500k timesteps)
+4. Initialize TradingEnv with frozen Analyst → train PPO agent (5M timesteps)
 5. Run out-of-sample backtest (final 15%) → compare to buy-and-hold baseline
 
 **Individual modules**:
@@ -237,7 +238,59 @@ python scripts/run_pipeline.py --backtest-only   # Only run backtest
 python -m src.training.train_analyst     # Train Analyst only
 python -m src.training.train_agent       # Train Agent only (requires trained Analyst)
 python -m src.evaluation.backtest        # Run backtest only
+
+# Real-time Visualization Dashboard
+cd frontend && npm install               # First time setup
+python scripts/start_dashboard.py        # Start dashboard (backend + frontend)
 ```
+
+## Real-Time Visualization Dashboard
+
+A stunning React + Next.js dashboard for monitoring training in real-time.
+
+**Architecture**:
+- Backend: FastAPI + WebSocket (port 8000)
+- Frontend: Next.js + Recharts + Framer Motion (port 3000)
+- Non-blocking: Training never slows down due to visualization
+
+**Features**:
+- **Price Chart**: TradingView-style candlesticks with trade markers, SL/TP lines
+- **Neural Network Flow**: Animated attention weights, encoder activations, direction predictions
+- **Training Metrics**: Loss curves, episode rewards, equity curve with drawdown
+- **Market Gauges**: ATR, Choppiness, ADX, regime indicators
+- **Agent Panel**: Position status, value estimates, action probabilities
+- **Reward Breakdown**: Waterfall chart showing PnL delta, penalties, bonuses
+- **Trade Log**: Live entry/exit tracking with win rate stats
+- **System Status**: Memory usage, training speed, connection status
+
+**Setup**:
+```bash
+# Install Python dependencies
+pip install fastapi uvicorn websockets orjson pydantic psutil
+
+# Install frontend dependencies
+cd frontend && npm install
+
+# Start dashboard
+python scripts/start_dashboard.py
+# Opens http://localhost:3000
+```
+
+**Enabling Visualization During Training**:
+```python
+# In config/settings.py, set:
+visualization: VisualizationConfig = field(default_factory=lambda: VisualizationConfig(enabled=True))
+
+# Or pass to AgentTrainingLogger:
+callback = AgentTrainingLogger(log_dir="models/agent", enable_visualization=True)
+```
+
+**Key Files**:
+- `visualization/server.py`: FastAPI WebSocket server
+- `visualization/data_emitter.py`: Thread-safe training data broadcaster
+- `frontend/src/app/page.tsx`: Main dashboard layout
+- `frontend/src/components/charts/`: Chart components
+- `frontend/src/hooks/useWebSocket.ts`: WebSocket connection hook
 
 ## File Organization Specifics
 
@@ -265,14 +318,15 @@ python -m src.evaluation.backtest        # Run backtest only
 
 **Environment Observation Construction** (trading_env.py:256):
 ```python
-obs = [context_vector (64), position_state (3), market_features (5)]  # Total: 72 dims
+obs = [context_vector (64), analyst_metrics (5), position_state (3), market_features (5)]  # Total: 77 dims
+# analyst_metrics: [p_down, p_up, edge, confidence, uncertainty]
 # position_state: [position {-1,0,1}, entry_price_norm, unrealized_pnl_norm]
 # market_features (Z-normalized): [atr, chop, adx, regime, sma_distance]
 ```
 
 **Reward Scaling Logic** (config/settings.py:144):
-- `reward_scaling = 0.1` converts ±20 pip trade to ±2.0 reward
-- Makes penalties (-2.0 FOMO, -1.0 chop) meaningful vs PnL
+- `reward_scaling = 0.2` converts ±10 pip trade to ±2.0 reward
+- Makes penalties (-0.5 FOMO, -0.05 chop) meaningful vs PnL
 - Encourages "Sniper" behavior: selective, high-quality trades
 
 ## Debugging & Monitoring

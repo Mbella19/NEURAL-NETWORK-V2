@@ -230,13 +230,15 @@ class MarketAnalyst(nn.Module):
         self,
         x_15m: torch.Tensor,
         x_1h: torch.Tensor,
-        x_4h: torch.Tensor
-    ) -> torch.Tensor:
+        x_4h: torch.Tensor,
+        return_weights: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Internal method: encode all timeframes and fuse to context.
 
         Returns:
             context: Context vector [batch, context_dim]
+            weights: Attention weights [batch, 2] (optional)
         """
         # Ensure float32
         x_15m = x_15m.float()
@@ -249,11 +251,17 @@ class MarketAnalyst(nn.Module):
         enc_4h = self.encoder_4h(x_4h)
 
         # Fuse timeframes
-        fused = self.fusion(enc_15m, enc_1h, enc_4h)  # [batch, d_model]
+        weights = None
+        if return_weights and isinstance(self.fusion, AttentionFusion):
+            fused, weights = self.fusion.forward_with_weights(enc_15m, enc_1h, enc_4h)
+        else:
+            fused = self.fusion(enc_15m, enc_1h, enc_4h)  # [batch, d_model]
 
         # Project to context dimension
         context = self.context_proj(fused)  # [batch, context_dim]
 
+        if return_weights:
+            return context, weights
         return context
 
     def forward(
@@ -286,7 +294,10 @@ class MarketAnalyst(nn.Module):
                           horizon_1h_logits, horizon_2h_logits)
         """
         # Encode and fuse to context
-        context = self._encode_and_fuse(x_15m, x_1h, x_4h)
+        if return_aux: # If aux requested, we might want weights too? No, keep separate.
+            context = self._encode_and_fuse(x_15m, x_1h, x_4h)
+        else:
+            context = self._encode_and_fuse(x_15m, x_1h, x_4h)
 
         # Main direction prediction (4H horizon)
         direction = self.direction_head(context)  # [batch, 1] for binary, [batch, n] for multi
@@ -341,7 +352,7 @@ class MarketAnalyst(nn.Module):
         x_15m: torch.Tensor,
         x_1h: torch.Tensor,
         x_4h: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Get context vector AND probabilities (for RL agent).
 
@@ -354,10 +365,14 @@ class MarketAnalyst(nn.Module):
             Tuple of:
                 - context: Context vector [batch, context_dim]
                 - probs: Probabilities [batch, num_classes]
-                    For binary: [batch, 2] as [p_down, p_up]
-                    For multi-class: [batch, num_classes] via softmax
+                - weights: Attention weights [batch, 2]
         """
-        context, logits = self.forward(x_15m, x_1h, x_4h)
+        # Manually call encode_and_fuse to get weights
+        context, weights = self._encode_and_fuse(x_15m, x_1h, x_4h, return_weights=True)
+        
+        # Get predictions
+        direction = self.direction_head(context)
+        logits = direction
 
         if self.num_classes == 2:
             # Binary: logits is [batch, 1], convert to [batch, 2] probs
@@ -368,7 +383,7 @@ class MarketAnalyst(nn.Module):
             # Multi-class: use softmax
             probs = torch.softmax(logits, dim=-1)
 
-        return context, probs
+        return context, probs, weights
 
     def freeze(self):
         """
