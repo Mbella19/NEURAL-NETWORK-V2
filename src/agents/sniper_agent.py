@@ -15,7 +15,7 @@ from pathlib import Path
 import gc
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 
@@ -53,6 +53,7 @@ class TrainingMetricsCallback(BaseCallback):
         self.log_freq = log_freq
         self.episode_rewards = []
         self.episode_lengths = []
+        self.episode_trades_history = []  # Track trades per episode
 
     def _on_step(self) -> bool:
         # Check for episode end
@@ -63,14 +64,20 @@ class TrainingMetricsCallback(BaseCallback):
                     if 'episode' in info:
                         self.episode_rewards.append(info['episode']['r'])
                         self.episode_lengths.append(info['episode']['l'])
+                        
+                        # Capture n_trades if available
+                        n_trades = info.get('n_trades', 0)
+                        self.episode_trades_history.append(n_trades)
 
         # Log periodically
         if self.n_calls % self.log_freq == 0 and self.verbose > 0:
             if len(self.episode_rewards) > 0:
                 mean_reward = np.mean(self.episode_rewards[-100:])
                 mean_length = np.mean(self.episode_lengths[-100:])
+                mean_trades = np.mean(self.episode_trades_history[-100:]) if self.episode_trades_history else 0.0
+                
                 print(f"Step {self.n_calls}: Mean Reward={mean_reward:.2f}, "
-                      f"Mean Length={mean_length:.0f}")
+                      f"Mean Length={mean_length:.0f}, Mean Trades={mean_trades:.1f}")
 
         return True
 
@@ -227,6 +234,17 @@ class SniperAgent:
             MemoryCleanupCallback(cleanup_freq=5000, verbose=self.verbose),
             TrainingMetricsCallback(log_freq=2000, verbose=self.verbose)
         ]
+
+        # Add Checkpoint Callback (Save every 100k steps)
+        if save_path:
+            checkpoint_path = Path(save_path).parent / "checkpoints"
+            callback_list.append(CheckpointCallback(
+                save_freq=100_000,
+                save_path=str(checkpoint_path),
+                name_prefix="sniper_model",
+                save_replay_buffer=False,
+                save_vecnormalize=True
+            ))
 
         if callbacks:
             callback_list.extend(callbacks)

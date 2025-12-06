@@ -497,7 +497,10 @@ def main():
             'pinbar', 'engulfing', 'doji',     # Price action patterns
             'ema_trend', 'ema_crossover',      # Trend indicators
             'regime', 'sma_distance',          # Regime/trend filters
-            'dist_to_resistance', 'dist_to_support'  # S/R distance (new)
+            'dist_to_resistance', 'dist_to_support', # S/R distance
+            'bos_bullish', 'bos_bearish',      # Market Structure (Break of Structure)
+            'choch_bullish', 'choch_bearish',  # Market Structure (Change of Character)
+            'atr', 'chop', 'adx'               # Volatility & Strength (Normalized)
         ]
         
         # All feature columns including raw values (for normalization step)

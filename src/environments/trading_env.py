@@ -90,6 +90,7 @@ class TradingEnv(gym.Env):
         # OHLC data for visualization (real candle data)
         ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
+        noise_level: float = 0.001,  # Anti-overfitting noise (default enabled)
     ):
         """
         Initialize the trading environment.
@@ -113,10 +114,14 @@ class TradingEnv(gym.Env):
             reward_scaling: Scale factor for PnL rewards (0.1 = ±20 pips becomes ±2.0)
                            This balances PnL with penalties for "Sniper" behavior.
             device: Torch device for analyst inference
+            noise_level: Std dev of Gaussian noise to add to observations (0.0 = disabled)
         """
         super().__init__()
 
-        # Store data (ensure float32)
+        # Anti-Overfitting: Gaussian Noise
+        self.noise_level = noise_level 
+        if self.noise_level > 0:
+            print(f"Gaussian Noise Injection ENABLED: sigma={self.noise_level}")
         self.data_15m = data_15m.astype(np.float32)
         self.data_1h = data_1h.astype(np.float32)
         self.data_4h = data_4h.astype(np.float32)
@@ -484,6 +489,11 @@ class TradingEnv(gym.Env):
 
         # Combine all (all components now on similar scales)
         obs = np.concatenate([context, position_state, market_feat, analyst_metrics])
+
+        # Anti-Overfitting: Inject Gaussian Noise
+        if self.noise_level > 0:
+            noise = np.random.normal(0, self.noise_level, size=obs.shape).astype(np.float32)
+            obs += noise
 
         return obs.astype(np.float32)
 
@@ -1091,7 +1101,8 @@ def create_env_from_dataframes(
     analyst_model: Optional[torch.nn.Module] = None,
     feature_cols: Optional[list] = None,
     config: Optional[object] = None,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    noise_level: float = 0.001
 ) -> TradingEnv:
     """
     Factory function to create TradingEnv from DataFrames.
@@ -1214,7 +1225,9 @@ def create_env_from_dataframes(
         use_take_profit = getattr(config, 'use_take_profit', use_take_profit)
         volatility_sizing = getattr(config, 'volatility_sizing', volatility_sizing)
         risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
+        risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
         enforce_analyst_alignment = getattr(config, 'enforce_analyst_alignment', enforce_analyst_alignment)
+        noise_level = getattr(config, 'noise_level', noise_level)
 
     if analyst_model is not None:
         num_classes = getattr(analyst_model, 'num_classes', 2)
@@ -1248,4 +1261,5 @@ def create_env_from_dataframes(
         # Visualization data
         ohlc_data=ohlc_data,
         timestamps=timestamps,
+        noise_level=noise_level
     )
