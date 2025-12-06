@@ -1019,8 +1019,12 @@ class TradingEnv(gym.Env):
         terminated = self.current_idx >= self.end_idx
         truncated = self.steps >= self.max_steps
 
-        # Get new observation
-        obs = self._get_observation()
+        # Get new observation (guard against out-of-bounds access at episode end)
+        if terminated or truncated:
+            # Return dummy observation - episode is over, this won't be used for training
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+        else:
+            obs = self._get_observation()
 
         # Add episode info
         info['step'] = self.steps

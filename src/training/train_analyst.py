@@ -1498,6 +1498,7 @@ class AnalystTrainer:
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),  # FIXED: Save scheduler for resume
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'train_accs': self.train_accs,

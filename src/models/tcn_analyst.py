@@ -124,7 +124,7 @@ class TCNEncoder(nn.Module):
         self,
         input_dim: int,
         hidden_dim: int = 64,
-        num_blocks: int = 3,
+        num_blocks: int = 4,  # FIXED: Increased from 3 to 4 for larger receptive field
         kernel_size: int = 3,
         dropout: float = 0.2
     ):
@@ -133,6 +133,8 @@ class TCNEncoder(nn.Module):
             input_dim: Number of input features per timestep
             hidden_dim: Hidden dimension (output dimension)
             num_blocks: Number of residual blocks (each doubles dilation)
+                        - 3 blocks: RF = 1 + 2×(k-1)×7 = 29 (insufficient for 48-bar lookback)
+                        - 4 blocks: RF = 1 + 2×(k-1)×15 = 61 (covers full 48-bar lookback)
             kernel_size: Convolution kernel size
             dropout: Dropout rate
         """

@@ -142,7 +142,9 @@ class Backtester:
 
         pnl_pips_raw = self._calculate_pnl_pips(exit_price)  # Raw pips
         pnl_pips_sized = pnl_pips_raw * self.position_size   # Adjusted for position size
-        pnl_dollars = pnl_pips_sized * 10  # $10 per pip per lot
+        # FIXED: Use proper pip value calculation instead of hardcoded $10
+        # pip_value × lot_size = 0.0001 × 100000 = $10 for standard EURUSD lot
+        pnl_dollars = pnl_pips_sized * self.pip_value * self.lot_size
 
         # Record trade
         trade = TradeRecord(
@@ -182,8 +184,8 @@ class Backtester:
         self.entry_price = price
         self.entry_time = time
 
-        # Deduct spread cost
-        spread_cost = spread_pips * 10 * size  # $10 per pip
+        # Deduct spread cost (FIXED: use proper pip value calculation)
+        spread_cost = spread_pips * self.pip_value * self.lot_size * size
         self.balance -= spread_cost
 
     def _check_stop_loss_take_profit(
@@ -339,7 +341,8 @@ class Backtester:
                 self._open_position(-1, size, close, time, spread_pips)
 
         # Record equity (mark-to-market using close price)
-        unrealized_pnl = self._calculate_pnl_pips(close) * 10 * self.position_size
+        # FIXED: Use proper pip value calculation instead of hardcoded $10
+        unrealized_pnl = self._calculate_pnl_pips(close) * self.pip_value * self.lot_size * self.position_size
         self.equity_history.append(self.balance + unrealized_pnl)
 
         # Record action and position

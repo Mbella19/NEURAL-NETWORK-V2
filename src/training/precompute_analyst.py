@@ -86,30 +86,58 @@ def precompute_analyst_outputs(
     features_15m = df_15m[feature_cols].values.astype(np.float32)
     features_1h = df_1h[feature_cols].values.astype(np.float32)
     features_4h = df_4h[feature_cols].values.astype(np.float32)
-    
+
     # Get close prices for reference
     close_prices = df_15m['close'].values.astype(np.float32)
-    
-    # Calculate valid start index (need full lookback)
-    start_idx = max(lookback_15m, lookback_1h, lookback_4h)
+
+    # FIXED: Subsampling factors for multi-timeframe alignment
+    # 1H data is aligned to 15m index, so we subsample every 4th bar
+    # 4H data is aligned to 15m index, so we subsample every 16th bar
+    subsample_1h = 4
+    subsample_4h = 16
+
+    # FIXED: Calculate valid start index accounting for subsampling
+    # Need enough bars for: 15m lookback, 1H lookback*4, 4H lookback*16
+    start_idx = max(
+        lookback_15m,
+        (lookback_1h - 1) * subsample_1h + 1,  # For 24 1H candles: need 93 bars
+        (lookback_4h - 1) * subsample_4h + 1   # For 12 4H candles: need 177 bars
+    )
     n_samples = len(features_15m) - start_idx
-    
+
     logger.info(f"Pre-computing Analyst outputs for {n_samples:,} timesteps...")
-    logger.info(f"Start index: {start_idx} (after lookback warmup)")
-    
+    logger.info(f"Start index: {start_idx} (after lookback warmup with subsampling)")
+    logger.info(f"Subsampling: 1H every {subsample_1h} bars, 4H every {subsample_4h} bars")
+
     # Prepare windowed data (pre-window for each index)
     # This creates [n_samples, lookback, features] arrays
     logger.info("Creating windowed data arrays...")
-    
+
     data_15m = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
     data_1h = np.zeros((n_samples, lookback_1h, len(feature_cols)), dtype=np.float32)
     data_4h = np.zeros((n_samples, lookback_4h, len(feature_cols)), dtype=np.float32)
-    
+
     for i in range(n_samples):
         idx = start_idx + i
-        data_15m[i] = features_15m[idx - lookback_15m:idx]
-        data_1h[i] = features_1h[idx - lookback_1h:idx]
-        data_4h[i] = features_4h[idx - lookback_4h:idx]
+
+        # 15m: direct slicing (include current candle)
+        data_15m[i] = features_15m[idx - lookback_15m + 1:idx + 1]
+
+        # FIXED: 1H - subsample every 4th bar, including current candle
+        idx_range_1h = list(range(
+            idx - (lookback_1h - 1) * subsample_1h,
+            idx + 1,
+            subsample_1h
+        ))
+        data_1h[i] = features_1h[idx_range_1h]
+
+        # FIXED: 4H - subsample every 16th bar, including current candle
+        idx_range_4h = list(range(
+            idx - (lookback_4h - 1) * subsample_4h,
+            idx + 1,
+            subsample_4h
+        ))
+        data_4h[i] = features_4h[idx_range_4h]
     
     logger.info(f"Windowed data shapes: 15m={data_15m.shape}, 1h={data_1h.shape}, 4h={data_4h.shape}")
     

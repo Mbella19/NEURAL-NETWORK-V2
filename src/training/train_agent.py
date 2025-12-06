@@ -593,15 +593,24 @@ def prepare_env_data(
 
     for i in range(n_samples):
         actual_idx = start_idx + i
-        # 15m: direct indexing
-        data_15m[i] = features_15m[actual_idx - lookback_15m:actual_idx]
-        
-        # FIXED: 1H - subsample every 4th bar from aligned data
-        idx_range_1h = list(range(actual_idx - lookback_1h * subsample_1h, actual_idx, subsample_1h))
+        # 15m: direct indexing (include current candle)
+        data_15m[i] = features_15m[actual_idx - lookback_15m + 1:actual_idx + 1]
+
+        # FIXED: 1H - subsample every 4th bar from aligned data, INCLUDING current candle
+        # range() is exclusive at end, so we use actual_idx + 1 to include current
+        idx_range_1h = list(range(
+            actual_idx - (lookback_1h - 1) * subsample_1h,
+            actual_idx + 1,
+            subsample_1h
+        ))
         data_1h[i] = features_1h[idx_range_1h]
-        
-        # FIXED: 4H - subsample every 16th bar from aligned data  
-        idx_range_4h = list(range(actual_idx - lookback_4h * subsample_4h, actual_idx, subsample_4h))
+
+        # FIXED: 4H - subsample every 16th bar from aligned data, INCLUDING current candle
+        idx_range_4h = list(range(
+            actual_idx - (lookback_4h - 1) * subsample_4h,
+            actual_idx + 1,
+            subsample_4h
+        ))
         data_4h[i] = features_4h[idx_range_4h]
 
     # Close prices
