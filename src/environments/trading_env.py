@@ -572,13 +572,16 @@ class TradingEnv(gym.Env):
                     'close_reason': 'stop_loss'
                 })
 
+                # Calculate final delta before reset
+                final_delta = pnl - self.prev_unrealized_pnl
+
                 # Reset
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
 
-                return pnl * self.reward_scaling, {
+                return final_delta * self.reward_scaling, {
                     'stop_loss_triggered': True,
                     'trade_closed': True,
                     'close_reason': 'stop_loss',
@@ -601,12 +604,15 @@ class TradingEnv(gym.Env):
                     'close_reason': 'take_profit'
                 })
 
+                # Calculate final delta before reset
+                final_delta = pnl - self.prev_unrealized_pnl
+
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
 
-                return pnl * self.reward_scaling, {
+                return final_delta * self.reward_scaling, {
                     'take_profit_triggered': True,
                     'trade_closed': True,
                     'close_reason': 'take_profit',
@@ -634,12 +640,15 @@ class TradingEnv(gym.Env):
                     'close_reason': 'stop_loss'
                 })
 
+                # Calculate final delta before reset
+                final_delta = pnl - self.prev_unrealized_pnl
+
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
 
-                return pnl * self.reward_scaling, {
+                return final_delta * self.reward_scaling, {
                     'stop_loss_triggered': True,
                     'trade_closed': True,
                     'close_reason': 'stop_loss',
@@ -662,12 +671,15 @@ class TradingEnv(gym.Env):
                     'close_reason': 'take_profit'
                 })
 
+                # Calculate final delta before reset
+                final_delta = pnl - self.prev_unrealized_pnl
+
                 self.position = 0
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
 
-                return pnl * self.reward_scaling, {
+                return final_delta * self.reward_scaling, {
                     'take_profit_triggered': True,
                     'trade_closed': True,
                     'close_reason': 'take_profit',
