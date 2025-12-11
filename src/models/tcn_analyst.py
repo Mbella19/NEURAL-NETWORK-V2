@@ -1,15 +1,59 @@
 """
 TCN (Temporal Convolutional Network) Market Analyst Model.
 
+RECOMMENDED: This is the preferred architecture for production use.
+
 A simpler, more stable alternative to the Transformer-based Analyst.
 TCNs are better suited for time series classification due to:
 - Built-in temporal causality (dilated convolutions)
-- Stable gradient flow (no attention collapse)
-- Parameter efficient (shared conv kernels)
+- Stable gradient flow (no attention collapse issues)
+- Parameter efficient (shared conv kernels, ~93K params vs 370K for Transformer)
 - Proven performance on financial time series
+
+Architecture Overview:
+    Input:  Multi-timeframe OHLCV features with technical indicators
+            - 15m: [batch, lookback_15m, features_15m] (e.g., 48 bars = 12 hours)
+            - 1H:  [batch, lookback_1h, features_1h]   (e.g., 16 bars = 16 hours)
+            - 4H:  [batch, lookback_4h, features_4h]   (e.g., 6 bars = 24 hours)
+
+    Encoders:
+            3 TCNEncoders (one per timeframe)
+            Each uses stacked TCNResidualBlocks with exponential dilation [1, 2, 4, 8, ...]
+            Output: [batch, d_model] representation per timeframe
+
+    Fusion:
+            AttentionFusion layer combines timeframes
+            15m queries 1H+4H via cross-attention
+            Output: [batch, d_model]
+
+    Projection:
+            context_proj: Linear + LayerNorm -> [batch, context_dim]
+
+    Output:
+            - Context Vector: [batch, context_dim] (frozen for RL agent)
+            - Direction Prediction: [batch, num_classes] (for supervised training)
+
+TCN Advantages over Transformers:
+    1. No attention collapse - TCNs use fixed convolutional patterns
+    2. Better gradient flow - residual connections + weight normalization
+    3. Lower memory - no O(n^2) attention matrices
+    4. Inherent causality - dilated convolutions naturally respect time order
 
 This module provides a drop-in replacement for MarketAnalyst with
 the same interface (forward, get_context, get_probabilities, freeze/unfreeze).
+
+Usage:
+    # Create TCN analyst
+    model = create_tcn_analyst(feature_dims={'15m': 18, '1h': 18, '4h': 18}, config, device)
+
+    # Training
+    output = model(x_15m, x_1h, x_4h)  # Returns dict with 'logits', 'context', 'probs'
+
+    # Freeze for RL
+    model.freeze()
+
+    # Get context vectors for RL agent
+    context, probs = model.get_context(x_15m, x_1h, x_4h)
 """
 
 import torch
@@ -123,10 +167,10 @@ class TCNEncoder(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 64,
-        num_blocks: int = 4,  # FIXED: Increased from 3 to 4 for larger receptive field
+        hidden_dim: int = 32,
+        num_blocks: int = 3,  # AnalystConfig default (4 provides larger receptive field)
         kernel_size: int = 3,
-        dropout: float = 0.2
+        dropout: float = 0.3
     ):
         """
         Args:
@@ -214,11 +258,11 @@ class TCNAnalyst(nn.Module):
     def __init__(
         self,
         feature_dims: Dict[str, int],
-        d_model: int = 64,
+        d_model: int = 32,
         nhead: int = 4,  # Not used, kept for interface compatibility
         num_layers: int = 2,  # Not used, kept for interface compatibility
         dim_feedforward: int = 128,  # Not used
-        context_dim: int = 64,
+        context_dim: int = 32,
         dropout: float = 0.3,
         use_lightweight: bool = False,  # Not used
         num_classes: int = 2,
@@ -535,8 +579,8 @@ def create_tcn_analyst(
     if config is None:
         model = TCNAnalyst(
             feature_dims=feature_dims,
-            d_model=64,
-            context_dim=64,
+            d_model=32,
+            context_dim=32,
             dropout=0.3,
             num_classes=2,
             num_blocks=3,

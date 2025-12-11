@@ -96,14 +96,14 @@ class SniperAgent:
     def __init__(
         self,
         env: gym.Env,
-        learning_rate: float = 3e-4,
+        learning_rate: float = 1e-4,
         n_steps: int = 2048,
         batch_size: int = 256,        # Increased from 64 for stability
-        n_epochs: int = 20,           # Increased from 10
+        n_epochs: int = 10,           # Matches AgentConfig
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_range: float = 0.2,
-        ent_coef: float = 0.02,       # Increased for exploration
+        ent_coef: float = 0.01,       # Matches AgentConfig
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         net_arch: Optional[list] = None,
@@ -354,9 +354,7 @@ class SniperAgent:
                     confidence = direction_probs[0, chosen_dir].item()
                     
                     if confidence < min_action_confidence and chosen_dir != 0:
-                        # DEBUG: Print intervention
-                        # print(f"THRESHOLD INTERVENTION: Action {chosen_dir} (Conf {confidence:.2f} < {min_action_confidence}) -> FLAT")
-                        # Force Flat
+                        # Force Flat when confidence is below threshold
                         action[0] = 0
                         
                 else:
@@ -370,9 +368,9 @@ class SniperAgent:
                             # Force Flat
                             action[i, 0] = 0
                             
-            except Exception as e:
-                # print(f"DEBUG: Confidence check failed: {e}")
-                pass # Silently fail if structure mismatch to avoid crashing trade execution
+            except Exception:
+                # Silently fail if structure mismatch to avoid crashing trade execution
+                pass
 
         return action, states
 

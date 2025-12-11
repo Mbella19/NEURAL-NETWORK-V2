@@ -1,16 +1,69 @@
 """
 Training script for the PPO Sniper Agent.
 
-Trains the RL agent using a frozen Market Analyst to provide
-context vectors for decision making.
+This module handles the complete RL training pipeline for the Sniper Agent,
+which learns to make trading decisions using context vectors from a frozen
+Market Analyst model.
 
-Memory-optimized for Apple M2 Silicon.
+Training Pipeline:
+    1. Load frozen Market Analyst model (pre-trained on supervised task)
+    2. Prepare multi-timeframe data (15m, 1H, 4H aligned)
+    3. Create TradingEnv with frozen Analyst for context generation
+    4. Train PPO agent using Stable Baselines 3
+    5. Log detailed metrics and create visualizations
 
-Features:
-- Comprehensive logging of training progress
-- Detailed reward and action statistics
-- Training visualizations (reward curves, action distributions)
-- Episode-level tracking and analysis
+Key Components:
+    AgentTrainingLogger:
+        Custom SB3 callback that tracks:
+        - Episode rewards and cumulative PnL
+        - Action distributions (direction and size)
+        - Win rate evolution over time
+        - Per-episode trading statistics
+        - Real-time visualization emission (if enabled)
+
+    prepare_env_data():
+        Converts DataFrames to windowed numpy arrays for environment
+
+    create_trading_env():
+        Factory function to create TradingEnv with all config parameters
+
+    train_agent():
+        Main training orchestrator function
+
+Training Configuration (v16 defaults):
+    - learning_rate: 1e-4
+    - n_steps: 2048 (steps per update)
+    - batch_size: 256
+    - n_epochs: 10
+    - ent_coef: 0.01 (entropy bonus)
+    - total_timesteps: 20,000,000
+
+Memory Optimization (Apple M2 8GB):
+    - Batch processing with MPS cache clearing
+    - Pre-computed analyst context vectors
+    - Periodic memory cleanup via callbacks
+
+Visualization Integration:
+    When visualization is enabled, the callback emits real-time data to
+    the WebSocket server for the React dashboard, including:
+    - OHLC candles with trade markers
+    - Reward components breakdown
+    - Action probabilities and value estimates
+    - System metrics (memory, speed)
+
+Usage:
+    # Run full training
+    python -m src.training.train_agent
+
+    # Or call programmatically
+    from src.training.train_agent import train_agent
+    agent = train_agent(config, df_15m, df_1h, df_4h)
+
+Outputs:
+    - models/agent/final_model.zip: Trained SB3 model
+    - models/agent/training_*.log: Training logs
+    - models/agent/agent_training_summary.png: Training visualizations
+    - models/agent/agent_training_metrics.json: Episode metrics
 """
 
 import torch
@@ -555,9 +608,9 @@ def prepare_env_data(
     df_1h,
     df_4h,
     feature_cols: list,
-    lookback_15m: int = 20,
-    lookback_1h: int = 24,
-    lookback_4h: int = 12
+    lookback_15m: int = 48,
+    lookback_1h: int = 16,
+    lookback_4h: int = 6
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Prepare windowed data for the trading environment.
@@ -670,11 +723,11 @@ def create_trading_env(
     slippage_pips = 0.5     # Includes commission + slippage
     fomo_penalty = -0.5     # Moderate penalty for missing high-momentum moves
     chop_penalty = 0.0      # Disabled
-    fomo_threshold_atr = 4.0  # Trigger on >1.5x ATR moves
+    fomo_threshold_atr = 4.0  # Trigger on >4.0x ATR moves
     chop_threshold = 80.0   # Only extreme chop triggers penalty
     max_steps = 500
-    reward_scaling = 0.1    # 1.0 reward per 1 pip (safe after fixing unit bugs)
-    context_dim = 64
+    reward_scaling = 0.1    # 0.1 reward per 1 pip (scaled for stability)
+    context_dim = 32        # Matches AnalystConfig default
     trade_entry_bonus = 0.01  # Moderate bonus (~half of entry cost)
 
     # Risk Management defaults
@@ -744,7 +797,7 @@ def create_trading_env(
         reward_scaling=reward_scaling,  # v15 FIX: Use local variable, not config directly
         trade_entry_bonus=trade_entry_bonus,  # v15: Exploration bonus
         device=device,
-        noise_level=getattr(config, 'noise_level', 0.01) if config else 0.0,
+        noise_level=getattr(getattr(config, 'trading', config), 'noise_level', 0.01) if config else 0.0,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
         # Risk Management
@@ -888,7 +941,7 @@ def train_agent(
     if all(col in df_15m.columns for col in ['open', 'high', 'low', 'close']):
         ohlc_data = df_15m[['open', 'high', 'low', 'close']].values[start_idx:start_idx + n_samples].astype(np.float32)
         logger.info(f"OHLC data extracted: {ohlc_data.shape}, range: {ohlc_data[:, 3].min():.5f} - {ohlc_data[:, 3].max():.5f}")
-        logger.info(f"First 5 OHLC rows:\n{ohlc_data[:5]}") # DEBUG: Check if values are raw or normalized
+        logger.debug(f"First 5 OHLC rows:\n{ohlc_data[:5]}")
     
     if df_15m.index.dtype == 'datetime64[ns]' or hasattr(df_15m.index, 'to_pydatetime'):
         try:

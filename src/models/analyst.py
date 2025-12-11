@@ -1,12 +1,57 @@
 """
-Market Analyst Model - Complete supervised learning module.
+Market Analyst Model - Transformer-based supervised learning module.
 
-The Analyst produces a dense "Context Vector" that summarizes market state
-across all timeframes. It predicts a discrete class for smoothed future
-returns (direction-focused) to learn sustained momentum rather than noise.
+This module implements the Market Analyst using Transformer encoders for
+multi-timeframe feature extraction. The Analyst produces a dense "Context Vector"
+that summarizes market state across all timeframes (15m, 1H, 4H).
 
-After training, the Analyst is frozen and its context vector is consumed
-by the PPO Sniper Agent.
+Architecture Overview:
+    Input:  Multi-timeframe OHLCV features with technical indicators
+            - 15m: [batch, lookback_15m, features_15m] (e.g., 48 bars = 12 hours)
+            - 1H:  [batch, lookback_1h, features_1h]   (e.g., 16 bars = 16 hours)
+            - 4H:  [batch, lookback_4h, features_4h]   (e.g., 6 bars = 24 hours)
+
+    Encoders:
+            3 TransformerEncoders (one per timeframe)
+            Each produces: [batch, d_model] representation
+
+    Fusion:
+            AttentionFusion layer combines timeframes
+            15m queries 1H+4H via cross-attention
+            Output: [batch, d_model]
+
+    Projection:
+            context_proj: Linear + LayerNorm -> [batch, context_dim]
+
+    Output:
+            - Context Vector: [batch, context_dim] (frozen for RL agent)
+            - Direction Prediction: [batch, num_classes] (for supervised training)
+
+Training Target:
+    Smoothed future returns (NOT next-step price):
+    target = df['close'].shift(-12).rolling(12).mean() / df['close'] - 1
+
+    This captures sustained directional moves rather than noise.
+
+Usage:
+    Training Phase:
+        - Train on smoothed future returns using MSE/CrossEntropy loss
+        - Use forward() to get both context and prediction
+
+    RL Phase:
+        - Freeze all parameters (param.requires_grad = False)
+        - Set to eval() mode
+        - Use get_context() for frozen context vectors consumed by PPO agent
+
+Note:
+    For production use, TCNAnalyst (in tcn_analyst.py) is recommended as it
+    provides more stable training for binary classification tasks.
+
+Memory Optimization (Apple M2 8GB):
+    - d_model: 32 (optimized for M2)
+    - nhead: 4
+    - num_layers: 2
+    - All computations in float32
 """
 
 import torch
@@ -14,8 +59,11 @@ import torch.nn as nn
 from typing import Dict, Tuple, Optional
 import gc
 
-from .encoders import TransformerEncoder, LightweightEncoder
-from .fusion import AttentionFusion, SimpleFusion, ConcatFusion
+from .encoders import TransformerEncoder
+from .fusion import AttentionFusion
+
+# NOTE: LightweightEncoder, SimpleFusion, ConcatFusion have been archived to
+# archive/legacy_code/ as they were never used in production.
 
 
 class MarketAnalyst(nn.Module):
@@ -35,14 +83,14 @@ class MarketAnalyst(nn.Module):
     def __init__(
         self,
         feature_dims: Dict[str, int],
-        d_model: int = 64,
+        d_model: int = 32,
         nhead: int = 4,
         num_layers: int = 2,
         dim_feedforward: int = 128,
-        context_dim: int = 64,
-        dropout: float = 0.1,
+        context_dim: int = 32,
+        dropout: float = 0.3,
         use_lightweight: bool = False,
-        num_classes: int = 5
+        num_classes: int = 2
     ):
         """
         Args:
@@ -67,51 +115,41 @@ class MarketAnalyst(nn.Module):
         self.context_dim = context_dim
         self.num_classes = num_classes
 
-        # Choose encoder type
-        EncoderClass = LightweightEncoder if use_lightweight else TransformerEncoder
-
-        # Create encoder for each timeframe
+        # DEPRECATED: use_lightweight parameter is no longer supported
+        # LightweightEncoder has been archived. Only TransformerEncoder is used.
         if use_lightweight:
-            self.encoder_15m = LightweightEncoder(
-                feature_dims.get('15m', 12),
-                hidden_dim=d_model,
-                dropout=dropout
+            import warnings
+            warnings.warn(
+                "use_lightweight=True is deprecated. LightweightEncoder has been archived. "
+                "Using TransformerEncoder instead.",
+                DeprecationWarning
             )
-            self.encoder_1h = LightweightEncoder(
-                feature_dims.get('1h', 12),
-                hidden_dim=d_model,
-                dropout=dropout
-            )
-            self.encoder_4h = LightweightEncoder(
-                feature_dims.get('4h', 12),
-                hidden_dim=d_model,
-                dropout=dropout
-            )
-        else:
-            self.encoder_15m = TransformerEncoder(
-                feature_dims.get('15m', 12),
-                d_model=d_model,
-                nhead=nhead,
-                num_layers=num_layers,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout
-            )
-            self.encoder_1h = TransformerEncoder(
-                feature_dims.get('1h', 12),
-                d_model=d_model,
-                nhead=nhead,
-                num_layers=num_layers,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout
-            )
-            self.encoder_4h = TransformerEncoder(
-                feature_dims.get('4h', 12),
-                d_model=d_model,
-                nhead=nhead,
-                num_layers=num_layers,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout
-            )
+
+        # Create TransformerEncoder for each timeframe
+        self.encoder_15m = TransformerEncoder(
+            feature_dims.get('15m', 12),
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
+        self.encoder_1h = TransformerEncoder(
+            feature_dims.get('1h', 12),
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
+        self.encoder_4h = TransformerEncoder(
+            feature_dims.get('4h', 12),
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
 
         # Fusion layer
         self.fusion = AttentionFusion(
@@ -438,16 +476,16 @@ def create_analyst(
         MarketAnalyst model
     """
     if config is None:
-        # Default configuration
+        # Default configuration (matches AnalystConfig)
         model = MarketAnalyst(
             feature_dims=feature_dims,
-            d_model=64,
+            d_model=32,
             nhead=4,
             num_layers=2,
             dim_feedforward=128,
-            context_dim=64,
-            dropout=0.1,
-            num_classes=5
+            context_dim=32,
+            dropout=0.3,
+            num_classes=2
         )
     else:
         model = MarketAnalyst(

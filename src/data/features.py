@@ -1,11 +1,60 @@
 """
-Feature engineering module for the hybrid trading system.
+Feature engineering module for the EURUSD hybrid trading system.
 
-Implements:
-- Price Action Patterns: Pinbar, Engulfing, Doji
-- Market Structure: Fractal S/R, Distance to S/R
-- Trend Filters: SMA distance, EMA crossovers
-- Regime Detection: Choppiness Index, ADX
+This module provides comprehensive technical indicator calculations and
+price pattern detection for multi-timeframe analysis. All functions are
+designed to be NaN-safe and avoid look-ahead bias.
+
+Feature Categories:
+    1. Price Action Patterns:
+       - detect_pinbar(): Rejection candles with long wicks (wick > 2x body)
+       - detect_engulfing(): Bullish/bearish engulfing patterns
+       - detect_doji(): Indecision candles (body < 10% of range)
+
+    2. Market Structure:
+       - detect_fractals(): Williams fractals for swing highs/lows
+       - get_fractal_levels(): Extract S/R levels from fractals
+       - distance_to_nearest_sr(): ATR-normalized distance to support/resistance
+
+    3. Trend Filters:
+       - sma(): Simple Moving Average
+       - ema(): Exponential Moving Average
+       - sma_distance(): ATR-normalized distance from SMA
+       - ema_crossover(): Fast/slow EMA crossover signals
+       - ema_trend(): Price position relative to EMA
+
+    4. Regime Detection:
+       - atr(): Average True Range (volatility measure)
+       - choppiness_index(): Market choppiness (>61.8 ranging, <38.2 trending)
+       - adx(): Average Directional Index using Wilder's smoothing
+       - market_regime(): Combined regime classification
+
+    5. Target Engineering:
+       - create_smoothed_target(): Smoothed future returns for Analyst training
+       - create_binary_direction_target(): Balanced binary direction labels
+       - create_auxiliary_targets(): Volatility and regime prediction targets
+
+    6. Market Sessions:
+       - add_market_sessions(): Asian, London, NY session indicators
+
+    7. Structure Breaks:
+       - detect_structure_breaks(): Break of Structure (BOS) and Change of Character (CHoCH)
+
+Main Entry Point:
+    engineer_all_features(df): Apply all feature engineering to a DataFrame
+
+Look-Ahead Bias Prevention:
+    - All features use only past data (no .shift(-n) for indicators)
+    - Fractals are confirmed with a delay (right_bars parameter)
+    - Normalization uses training data statistics only
+
+Feature Columns (19 features returned by get_feature_columns()):
+    atr, pinbar, engulfing, doji, sma_distance, ema_crossover, ema_trend,
+    chop, adx, regime, returns, volatility, session_asian, session_london,
+    session_ny, bos_bullish, bos_bearish, choch_bullish, choch_bearish
+
+Memory Optimization:
+    All operations use float32 for Apple M2 compatibility.
 """
 
 import pandas as pd
@@ -709,8 +758,8 @@ def engineer_all_features(
 
 def create_smoothed_target(
     df: pd.DataFrame,
-    future_window: int = 24,
-    smooth_window: int = 24,
+    future_window: int = 16,
+    smooth_window: int = 8,
     scale_factor: float = 100.0
 ) -> pd.Series:
     """
@@ -847,8 +896,8 @@ def create_return_classes(
 def create_binary_direction_target(
     df: pd.DataFrame,
     future_window: int = 16,
-    smooth_window: int = 12,
-    min_move_atr: float = 0.3,
+    smooth_window: int = 8,
+    min_move_atr: float = 0.3,  # NOTE: AnalystConfig uses 7.0 for very selective filtering
     atr_period: int = 14
 ) -> Tuple[pd.Series, pd.Series, Dict[str, float]]:
     """

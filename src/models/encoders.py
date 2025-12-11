@@ -2,7 +2,7 @@
 Transformer-based temporal encoders for multi-timeframe data.
 
 Memory-optimized for Apple M2 Silicon (8GB RAM):
-- d_model: 64 (not 128/256)
+- d_model: 32-64 (not 128/256)
 - nhead: 4 (not 8)
 - num_layers: 2 (not 6)
 - All tensors float32
@@ -72,20 +72,20 @@ class TransformerEncoder(nn.Module):
         - Last-token pooling for forecasting (most recent state matters most)
 
     Memory Optimization:
-        - Uses d_model=64, nhead=4, num_layers=2 by default
+        - Uses d_model=32, nhead=4, num_layers=2 by default
         - All computations in float32
     """
 
     def __init__(
         self,
         input_dim: int,
-        d_model: int = 64,
+        d_model: int = 32,
         nhead: int = 4,
         num_layers: int = 2,
         dim_feedforward: int = 128,
         dropout: float = 0.1,
         max_len: int = 500,
-        use_temporal_bias: bool = True,
+        use_temporal_bias: bool = False,  # Deprecated: temporal_gate not used
         temporal_decay: float = 0.1
     ):
         """
@@ -130,10 +130,10 @@ class TransformerEncoder(nn.Module):
         # Layer normalization for output
         self.layer_norm = nn.LayerNorm(d_model)
 
-        # Temporal recency weighting (learnable decay applied after transformer)
-        # This scales each position's contribution based on recency
+        # Temporal recency weighting (DEPRECATED: Not used in forward())
+        # The temporal gate was adding complexity without benefit.
+        # Kept for backwards compatibility with old checkpoints.
         if use_temporal_bias:
-            # Learnable temporal gate that weights positions by recency
             self.temporal_gate = nn.Sequential(
                 nn.Linear(d_model, d_model // 2),
                 nn.GELU(),
@@ -226,74 +226,6 @@ class TransformerEncoder(nn.Module):
         return x
 
 
-class LightweightEncoder(nn.Module):
-    """
-    Even lighter encoder using Conv1D + attention for memory-constrained scenarios.
-
-    Use this if TransformerEncoder causes OOM on M2.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        kernel_size: int = 3,
-        num_layers: int = 2,
-        dropout: float = 0.1
-    ):
-        super().__init__()
-
-        self.conv_layers = nn.ModuleList()
-        self.norm_layers = nn.ModuleList()
-
-        # First layer: input_dim -> hidden_dim
-        self.conv_layers.append(
-            nn.Conv1d(input_dim, hidden_dim, kernel_size, padding=kernel_size // 2)
-        )
-        self.norm_layers.append(nn.BatchNorm1d(hidden_dim))
-
-        # Additional layers
-        for _ in range(num_layers - 1):
-            self.conv_layers.append(
-                nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=kernel_size // 2)
-            )
-            self.norm_layers.append(nn.BatchNorm1d(hidden_dim))
-
-        self.activation = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-        # Self-attention for global context
-        self.attention = nn.MultiheadAttention(
-            hidden_dim, num_heads=4, dropout=dropout, batch_first=True
-        )
-
-        self.output_dim = hidden_dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, seq_len, input_dim]
-
-        Returns:
-            [batch, hidden_dim]
-        """
-        # Conv1D expects [batch, channels, seq_len]
-        x = x.transpose(1, 2)
-
-        for conv, norm in zip(self.conv_layers, self.norm_layers):
-            residual = x if x.shape[1] == conv.out_channels else None
-            x = conv(x)
-            x = norm(x)
-            x = self.activation(x)
-            x = self.dropout(x)
-            if residual is not None:
-                x = x + residual
-
-        # Back to [batch, seq_len, hidden_dim]
-        x = x.transpose(1, 2)
-
-        # Self-attention
-        x, _ = self.attention(x, x, x)
-
-        # Pool: use last token for temporal forecasting
-        return x[:, -1, :]
+# NOTE: LightweightEncoder class has been archived to:
+# archive/legacy_code/lightweight_encoder.py
+# It was never used in production (TransformerEncoder is the active implementation).

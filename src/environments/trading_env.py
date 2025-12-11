@@ -21,24 +21,82 @@ import gc
 
 class TradingEnv(gym.Env):
     """
-    Trading environment for the PPO Sniper Agent.
+    Gymnasium trading environment for the PPO Sniper Agent.
 
-    Action Space:
-        Multi-Discrete([3, 4]):
-        - Direction: 0=Flat/Exit, 1=Long, 2=Short
-        - Size: 0=0.25x, 1=0.5x, 2=0.75x, 3=1.0x
+    This environment simulates EURUSD forex trading with a frozen Market Analyst
+    providing context vectors. Designed for Apple M2 Silicon with 8GB RAM.
 
-    Observation Space:
-        Box containing:
-        - Context vector from frozen Analyst (context_dim)
-        - Position state: [position, entry_price_norm, unrealized_pnl_norm]
-        - Market features: [atr, chop, adx, regime, sma_distance]
+    Action Space (MultiDiscrete([3, 4])):
+        Component 0 - Direction (3 actions):
+            0: Flat/Exit - Close any open position or stay flat
+            1: Long - Open or hold a long position (buy EURUSD)
+            2: Short - Open or hold a short position (sell EURUSD)
 
-    Reward:
-        Base PnL (pips) × position_size
-        - Transaction cost when opening
-        - FOMO penalty when flat during momentum
-        - Chop penalty when holding in ranging market
+        Component 1 - Size (4 actions):
+            0: 0.25x - Quarter position
+            1: 0.50x - Half position
+            2: 0.75x - Three-quarter position
+            3: 1.00x - Full position
+
+    Observation Space (Box, typically 47-49 dimensions):
+        The observation is a concatenation of:
+
+        1. Context Vector (context_dim, typically 32):
+           - Frozen embeddings from the Market Analyst model
+           - Encodes multi-timeframe market patterns
+
+        2. Position State (3 dims):
+           - position: Current position {-1=Short, 0=Flat, 1=Long}
+           - entry_price_norm: Normalized distance from entry price (ATR-scaled)
+           - unrealized_pnl_norm: Current unrealized PnL / 100 pips
+
+        3. Market Features (5-7 dims, Z-normalized):
+           - atr: Average True Range (volatility measure)
+           - chop: Choppiness Index (>61.8=ranging, <38.2=trending)
+           - adx: Average Directional Index (trend strength)
+           - regime: Market regime classification
+           - sma_distance: Distance to 200-period SMA
+           - dist_to_support: Distance to nearest support level (optional)
+           - dist_to_resistance: Distance to nearest resistance level (optional)
+
+        4. Analyst Metrics (5-6 dims):
+           Binary mode (num_classes=2):
+           - p_down: Probability of downward move
+           - p_up: Probability of upward move
+           - edge: p_up - p_down (directional bias)
+           - confidence: max(p_down, p_up)
+           - uncertainty: 1 - confidence
+
+           Multi-class mode (num_classes=3):
+           - p_down, p_neutral, p_up, edge, confidence, uncertainty
+
+        5. SL/TP Distance (2 dims):
+           - dist_sl_norm: ATR-normalized distance to stop-loss level
+           - dist_tp_norm: ATR-normalized distance to take-profit level
+
+    Reward Function (Continuous PnL Delta Model):
+        The reward is computed as the CHANGE in unrealized PnL each step,
+        not just on position exit. This prevents "death spiral" in choppy markets.
+
+        reward = pnl_delta * reward_scaling
+
+        Additional components:
+        - Transaction cost: -(spread + slippage) * size * scaling (on entry)
+        - Trade entry bonus: +bonus (encourages exploration, offsets entry cost)
+        - FOMO penalty: -penalty (when flat during high momentum moves)
+        - Chop penalty: -penalty (when holding in extreme ranging conditions)
+
+    Risk Management:
+        - ATR-based Stop-Loss: entry_price +/- (ATR * sl_multiplier)
+        - ATR-based Take-Profit: entry_price +/- (ATR * tp_multiplier)
+        - SL/TP checked using High/Low prices for intra-bar accuracy
+
+    Episode Termination:
+        - terminated: True when current_idx reaches end of data
+        - truncated: True when step count exceeds max_steps
+
+    Attributes:
+        POSITION_SIZES: Tuple of position size multipliers (0.25, 0.5, 0.75, 1.0)
     """
 
     metadata = {'render_modes': ['human']}
@@ -54,19 +112,19 @@ class TradingEnv(gym.Env):
         close_prices: np.ndarray,
         market_features: np.ndarray,
         analyst_model: Optional[torch.nn.Module] = None,
-        context_dim: int = 64,
+        context_dim: int = 32,        # Matches AnalystConfig default
         lookback_15m: int = 48,
-        lookback_1h: int = 24,
-        lookback_4h: int = 12,
+        lookback_1h: int = 16,        # Matches DataConfig
+        lookback_4h: int = 6,         # Matches DataConfig
         spread_pips: float = 0.2,     # Razor/Raw spread
         slippage_pips: float = 0.5,   # Includes commission + slippage
-        fomo_penalty: float = -1.0,   # v15: Meaningful penalty for missing moves (was 0.0)
+        fomo_penalty: float = -0.5,   # Matches TradingConfig
         chop_penalty: float = 0.0,    # Disabled for stability
-        fomo_threshold_atr: float = 1.5,  # v15: Trigger on >1.5x ATR moves (was 2.0)
+        fomo_threshold_atr: float = 4.0,  # Matches TradingConfig
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
-        reward_scaling: float = 1.0,  # v15: 1.0 per 1 pip (was 0.01 = 1.0 per 100 pips)
-        trade_entry_bonus: float = 0.5,  # v15: Bonus for opening positions to encourage exploration
+        reward_scaling: float = 0.1,  # Matches TradingConfig (0.1 per pip)
+        trade_entry_bonus: float = 0.01,  # Matches TradingConfig
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
@@ -158,11 +216,8 @@ class TradingEnv(gym.Env):
         self.sl_atr_multiplier = sl_atr_multiplier
         self.tp_atr_multiplier = tp_atr_multiplier
         self.use_stop_loss = use_stop_loss
-        self.use_stop_loss = use_stop_loss
         self.use_take_profit = use_take_profit
-        
-        # Volatility Sizing
-        self.volatility_sizing = volatility_sizing
+
         # Volatility Sizing
         self.volatility_sizing = volatility_sizing
         self.risk_pips_target = risk_pips_target
@@ -429,7 +484,26 @@ class TradingEnv(gym.Env):
         )
 
     def _get_observation(self) -> np.ndarray:
-        """Construct observation vector."""
+        """
+        Construct the full observation vector for the current timestep.
+
+        The observation combines:
+        1. Context vector from frozen Analyst (encodes market patterns)
+        2. Position state (current position, entry price distance, unrealized PnL)
+        3. Market features (ATR, CHOP, ADX, regime, SMA distance)
+        4. Analyst metrics (directional probabilities, confidence, edge)
+        5. SL/TP distances (normalized distance to stop-loss and take-profit)
+
+        Returns:
+            np.ndarray: Observation vector of shape (obs_dim,) with dtype float32.
+                       Typical size is 47-49 dimensions depending on configuration.
+
+        Notes:
+            - All features are normalized to prevent scale inconsistencies
+            - Entry price normalization is ATR-scaled and clipped to [-10, 10]
+            - Market features use Z-score normalization from training data stats
+            - Optional Gaussian noise can be added for regularization
+        """
         # Context vector and probabilities
         # Get Analyst context
         context, probs, weights, activations = self._get_analyst_data(self.current_idx)
@@ -437,7 +511,7 @@ class TradingEnv(gym.Env):
         self.current_activations = activations # Store for info
 
         # Calculate Analyst metrics for observation
-        # [p_down, p_up, confidence, edge]
+        # [p_down, p_up, edge, confidence, uncertainty] (5 dims for binary mode)
         if len(probs) == 2 or self.num_classes == 2:
             p_down = probs[0]
             p_up = probs[1] if len(probs) > 1 else 1 - p_down
@@ -746,10 +820,35 @@ class TradingEnv(gym.Env):
 
     def _execute_action(self, action: np.ndarray) -> Tuple[float, dict]:
         """
-        Execute trading action and calculate reward.
+        Execute trading action and calculate reward using continuous PnL delta model.
+
+        This method handles:
+        1. Action validation and analyst alignment enforcement (if enabled)
+        2. Position sizing with optional volatility adjustment
+        3. Position entry/exit logic
+        4. Reward calculation using continuous PnL delta
+
+        Args:
+            action: Array of [direction, size_idx] where:
+                    - direction: 0=Flat/Exit, 1=Long, 2=Short
+                    - size_idx: 0-3 mapping to POSITION_SIZES (0.25, 0.5, 0.75, 1.0)
 
         Returns:
-            Tuple of (reward, info_dict)
+            Tuple of (reward, info_dict):
+            - reward: Float representing the step reward
+            - info_dict: Dictionary with trade details including:
+                - action_type: 'hold', 'open_long', 'open_short', 'close'
+                - pnl_delta: Change in unrealized PnL this step
+                - transaction_cost: Cost incurred on trade entry
+
+        Reward Calculation:
+            For open positions:
+                reward = (current_unrealized_pnl - prev_unrealized_pnl) * scaling
+            On position entry:
+                reward -= transaction_cost (spread + slippage)
+                reward += trade_entry_bonus (encourages exploration)
+            On position exit:
+                Final PnL delta captured before position reset
         """
         direction = action[0]  # 0=Flat, 1=Long, 2=Short
         size_idx = action[1]   # 0-3
@@ -1050,13 +1149,38 @@ class TradingEnv(gym.Env):
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """
-        Execute one step in the environment.
+        Execute one step in the trading environment.
+
+        The step execution order is:
+        1. Check stop-loss/take-profit (risk management first)
+        2. Execute agent's action (open/close/hold positions)
+        3. Advance timestep and check termination conditions
+        4. Construct new observation
 
         Args:
-            action: [direction, size] array
+            action: np.ndarray of shape (2,) containing:
+                    - action[0]: Direction (0=Flat/Exit, 1=Long, 2=Short)
+                    - action[1]: Size index (0-3 for 0.25x to 1.0x)
 
         Returns:
-            observation, reward, terminated, truncated, info
+            Tuple of (observation, reward, terminated, truncated, info):
+            - observation: np.ndarray of next state (see _get_observation)
+            - reward: Float combining SL/TP reward and action reward
+            - terminated: True if reached end of data
+            - truncated: True if exceeded max_steps
+            - info: Dict containing:
+                - step: Current step number
+                - position: Current position (-1, 0, 1)
+                - position_size: Current position size multiplier
+                - entry_price: Entry price if in position
+                - current_price: Current close price
+                - unrealized_pnl: Current unrealized PnL in pips
+                - total_pnl: Cumulative realized PnL
+                - n_trades: Number of completed trades
+                - atr, chop, adx, regime: Market features
+                - p_down, p_up: Analyst predictions
+                - ohlc: OHLC data for visualization (if available)
+                - trades: List of completed trades (only on episode end)
         """
         # FIRST: Check stop-loss/take-profit BEFORE agent action
         # This enforces risk management regardless of what the agent wants to do

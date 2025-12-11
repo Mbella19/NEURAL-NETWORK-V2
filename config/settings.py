@@ -126,13 +126,13 @@ class AnalystConfig:
     cache_clear_interval: int = 50
 
     # v9 FIX: TARGET DEFINITION - reduced horizon and smoothing for more predictable signal
-    future_window: int = 16      # 2 Hours (was 4H) - shorter = more predictable
-    smooth_window: int = 8      # 1 Hour (was 3H) - less smoothing = preserves signal
+    future_window: int = 16      # 4 Hours (16 x 15min) - shorter than previous 6H
+    smooth_window: int = 8       # 2 Hours (8 x 15min) - less smoothing = preserves signal
 
     # Binary classification mode
     num_classes: int = 2        # Binary: 0=Down, 1=Up
     use_binary_target: bool = True  # Use binary direction target
-    min_move_atr_threshold: float = 7  # v9 FIX: Was 0.3 - lower = 4x more training data
+    min_move_atr_threshold: float = 7  # v9 FIX: Was 0.3 - higher threshold = fewer but clearer directional signals
 
     # Auxiliary losses (multi-task learning)
     # v14: RE-ENABLED - easier tasks (regime ~70%, volatility ~65%) provide
@@ -153,17 +153,19 @@ class AnalystConfig:
         '4h': 1.0    # 4-hour horizon weight (primary target)
     })
 
-    # Legacy 3-class config (kept for compatibility)
+    # DEPRECATED: Legacy 3-class config from early development.
+    # Binary classification (num_classes=2) is now the standard.
+    # Kept for backwards compatibility with create_return_classes().
     class_std_thresholds: Tuple[float, float] = (-0.15, 0.15)
 
-    # Input Lookback Windows (Must match DataConfig)
-    # v9 FIX: INCREASED lookbacks to provide proper context WITHOUT overlapping prediction window
-    lookback_15m: int = 48      # 12 Hours - 6x prediction horizon (proper context)
+    # DEPRECATED: These duplicate DataConfig.lookback_windows.
+    # Use DataConfig.lookback_windows as the single source of truth.
+    # These are kept for backwards compatibility with existing code.
+    lookback_15m: int = 48      # 12 Hours - 6x prediction horizon
     lookback_1h: int = 16       # 16 Hours - captures full trading session
     lookback_4h: int = 6        # 24 Hours - captures daily trend
 
 
-@dataclass
 @dataclass
 class TradingConfig:
     """Trading environment configuration."""
@@ -171,16 +173,18 @@ class TradingConfig:
     slippage_pips: float = 0.5  # Includes commission + slippage
 
     # Confidence filtering: Only take trades when agent probability >= threshold
-    min_action_confidence: float = 0.95  # Filter low-confidence trades (0.0 = disabled)
+    min_action_confidence: float = 0.60  # Filter low-confidence trades (0.0 = disabled)
 
-    # NEW: Enforce Analyst Alignment (Action Masking)
-    # If True, Agent can ONLY trade in direction of Analyst (or Flat)
-    # DISABLED: Soft masking breaks PPO gradients - agent samples action X, gets
-    # masked to Flat, but PPO updates as if X led to the reward. This causes
-    # frozen action distributions and no learning.
+    # DEPRECATED: Enforce Analyst Alignment (Action Masking)
+    # PERMANENTLY DISABLED - breaks PPO gradients. The agent samples action X,
+    # gets masked to Flat, but PPO updates as if X led to the reward.
+    # This causes frozen action distributions and no learning.
+    # Kept for documentation purposes - DO NOT ENABLE.
     enforce_analyst_alignment: bool = False
-    
-    # NEW: Risk-Based Sizing (Not Fixed Lots)
+
+    # NOT IMPLEMENTED: Risk-Based Sizing was planned but never integrated.
+    # Position sizing uses POSITION_SIZES in TradingEnv instead.
+    # Kept for potential future implementation.
     risk_multipliers: Tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)
     
     # NEW: ATR-Based Stops (Not Fixed Pips)
@@ -196,9 +200,9 @@ class TradingConfig:
     # Previous v15 values (1.0, -1.0, 0.5) caused random trading because observation was inverted.
     fomo_penalty: float = -0.5    # Moderate penalty for missing high-momentum moves
     chop_penalty: float = 0.0     # Disabled (can cause over-penalization in legitimate ranging trades)
-    fomo_threshold_atr: float = 4.0  # Trigger on >1.5x ATR moves
+    fomo_threshold_atr: float = 4.0  # Trigger on >4.0x ATR moves (very high momentum)
     chop_threshold: float = 80.0     # Only extreme chop triggers penalty
-    reward_scaling: float = 0.1     # 1.0 reward per 1 pip (now safe after fixing unit bugs)
+    reward_scaling: float = 0.1     # 0.1 reward per 1 pip (scaled down for stability)
 
     # Trade entry bonus: Offsets entry cost to encourage exploration
     # Lower than v15 (0.5) to avoid random trading, but enough to offset spread+slippage
@@ -213,7 +217,7 @@ class TradingConfig:
     initial_balance: float = 10000.0
     
     # Validation
-    noise_level: float = 0.01  # Reduced to 2% to encourage more activity (was 5%)
+    noise_level: float = 0.01  # Reduced to 1% to encourage more activity (was 5%)
 
 
 @dataclass
@@ -221,16 +225,16 @@ class AgentConfig:
     """PPO Sniper Agent configuration."""
 
     # PPO hyperparameters (from CLAUDE.md spec)
-    # FIX v15: Previous ent_coef (0.01) caused rapid policy collapse to flat.
+    # FIX v15: Previous ent_coef (0.001) caused rapid policy collapse to flat.
     # For a 12-action discrete space, higher entropy is needed to maintain exploration.
-    learning_rate: float = 1e-4  # Higher initial LR for faster learning (was 1e-4)
+    learning_rate: float = 1e-4  # Standard LR for stable convergence
     n_steps: int = 2048         # Timesteps per update
     batch_size: int = 256       # Minibatch size
     n_epochs: int = 10          # Reduced to prevent overfitting (was 20)
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.01        # HIGH entropy to force exploration (was 0.01)
+    ent_coef: float = 0.01        # Entropy coefficient to maintain exploration
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -267,6 +271,34 @@ class FeatureConfig:
 
 
 @dataclass
+class LiveConfig:
+    """Live trading bridge configuration."""
+    
+    enabled: bool = False
+    
+    # Connection
+    host: str = "127.0.0.1"  # Localhost (Python Server)
+    port: int = 5555         # ZMQ/TCP Port
+    
+    # Trading
+    magic_number: int = 123456
+    symbol: str = "EURUSD"
+    
+    # Risk Management
+    risk_multiplier: float = 0.5  # DEPRECATED: Use risk_percent instead
+    risk_percent: float = 0.01  # Risk 1% of equity per trade
+    pip_value_per_lot: float = 10.0  # $10 per pip for EURUSD standard lot
+    max_drawdown_daily: float = 0.02  # 2% max daily loss
+    hard_stop_loss_pips: float = 50.0  # Emergency stop
+    min_lot_size: float = 0.01  # Broker minimum
+    max_lot_size: float = 10.0  # Safety cap
+    
+    # Synchronization
+    connection_timeout: int = 10
+    poll_interval: float = 0.1
+
+
+@dataclass
 class VisualizationConfig:
     """Real-time training visualization configuration."""
 
@@ -300,6 +332,7 @@ class Config:
     agent: AgentConfig = field(default_factory=AgentConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
 
     # Global settings
     seed: int = 42
